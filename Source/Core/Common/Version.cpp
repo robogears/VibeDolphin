@@ -21,17 +21,11 @@ namespace Common
 
 const std::string& GetScmRevStr()
 {
-  static const std::string scm_rev_str = EMULATOR_NAME " "
-  // Note this macro can be empty if the master branch does not exist.
-#if 1 - SCM_COMMITS_AHEAD_MASTER - 1 != 0
-                                                       "[" SCM_BRANCH_STR "] "
-#endif
-
-#ifdef __INTEL_COMPILER
-      BUILD_TYPE_STR SCM_DESC_STR "-ICC";
-#else
-      BUILD_TYPE_STR SCM_DESC_STR;
-#endif
+  // VibeDolphin fork: branded + fork-versioned string used for the window title and the
+  // About dialog. (The upstream Dolphin git-describe is still available via GetScmDescStr()
+  // / GetScmRevGitStr(); the network User-Agent below keeps EMULATOR_NAME so online updates
+  // / NUS are unaffected.)
+  static const std::string scm_rev_str = "VibeDolphin 0.1.2";
   return scm_rev_str;
 }
 
