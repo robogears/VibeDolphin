@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 
 #ifdef USE_RETRO_ACHIEVEMENTS
 #include "Common/Config/Config.h"
@@ -63,6 +64,11 @@ struct WindowSystemInfo;
 namespace Core
 {
 class System;
+}
+
+namespace WiiUtils
+{
+struct ForwarderSyncResult;
 }
 
 namespace DiscIO
@@ -129,9 +135,11 @@ private:
   void ScheduleForwarderAutoSync();
   void RunForwarderSync();
   // Shared body for the auto-sync, the Tools-menu action, and the kiosk pre-boot sync.
-  // When |synchronous| is true the reconcile runs inline (used before the kiosk boots the
-  // Wii Menu, so its NAND writes can't race the menu's reads); otherwise on a worker thread.
-  void RunForwarderSyncImpl(bool synchronous);
+  // |synchronous| runs the reconcile inline (kiosk pre-boot, so its NAND writes can't race
+  // the menu's reads); otherwise it runs on a tracked worker thread. |user_invoked| surfaces
+  // progress/result/early-return feedback (the auto-sync and kiosk paths stay silent).
+  void RunForwarderSyncImpl(bool synchronous, bool user_invoked);
+  void ShowForwarderSyncResult(const WiiUtils::ForwarderSyncResult& result);
   // Invoked when a forwarder channel banner bricks the Wii Menu's grid renderer: stops the
   // wedged session and tells the user (safe banners are rebuilt on the next launch).
   void OnWiiMenuBannerBrick();
@@ -265,6 +273,9 @@ private:
   // Kiosk mode (--wii-menu): booted straight into the Wii System Menu, fullscreen, with the
   // channel sync run synchronously before the boot.
   bool m_wii_menu_kiosk = false;
+  // Tracked worker for the background channel reconcile; joined in the destructor so a sync
+  // never outlives the window (which would race NAND teardown).
+  std::thread m_forwarder_sync_thread;
   // Polls for a Wii Menu banner brick (flagged on the CPU thread by the panic handler) while
   // the System Menu is the running session; armed in BootWiiSystemMenu, stopped on stop.
   QTimer* m_wii_menu_brick_timer = nullptr;

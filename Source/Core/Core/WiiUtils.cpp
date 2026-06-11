@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <bitset>
+#include <charconv>
 #include <cstddef>
 #include <cstring>
 #include <fstream>
@@ -92,6 +93,19 @@ std::atomic<bool> s_wii_menu_brick_detected{false};
 const char* const SAFE_MODE_MARKER = "forwarder_safe_mode";
 const char* const REGEN_PENDING_MARKER = "forwarder_regen_pending";
 
+// Parse a hex title id from a (possibly hand-edited / truncated) JSON string. Non-throwing
+// (Core is built with -fno-exceptions, so std::stoull on bad input would terminate); returns
+// nullopt to skip the row. LookupForwarderDiscPath runs on the emulation/CPU thread, so a
+// crash here would take down emulation.
+std::optional<u64> ParseHexTitleId(const std::string& s)
+{
+  u64 value = 0;
+  const auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), value, 16);
+  if (ec != std::errc{} || ptr != s.data() + s.size())
+    return std::nullopt;
+  return value;
+}
+
 // A full forwarders.json row (the lazy lookup map only retains title_id -> disc_path).
 struct ForwarderMapEntry
 {
@@ -99,7 +113,6 @@ struct ForwarderMapEntry
   std::string game_id;
   u16 revision = 0;
   std::string disc_path;
-  std::string long_name;
 };
 
 // Parse every field of forwarders.json (unlike the title_id+disc_path-only lazy loader).
@@ -125,11 +138,16 @@ std::vector<ForwarderMapEntry> LoadForwarderMapFull()
     const std::optional<std::string> disc = ReadStringFromJson(row, "disc_path");
     if (!tid || !disc)
       continue;
+    const std::optional<u64> title_id = ParseHexTitleId(*tid);
+    if (!title_id)
+    {
+      WARN_LOG_FMT(IOS_ES, "Forwarder map: bad title_id '{}'; skipping row", *tid);
+      continue;
+    }
     ForwarderMapEntry e;
-    e.title_id = std::stoull(*tid, nullptr, 16);
+    e.title_id = *title_id;
     e.disc_path = *disc;
     e.game_id = ReadStringFromJson(row, "game_id").value_or("");
-    e.long_name = ReadStringFromJson(row, "long_name").value_or("");
     const auto rev = row.find("revision");
     if (rev != row.end() && rev->second.is<double>())
       e.revision = static_cast<u16>(rev->second.get<double>());
@@ -138,7 +156,7 @@ std::vector<ForwarderMapEntry> LoadForwarderMapFull()
   return entries;
 }
 
-// Serialize the forwarder map (same schema InstallForwardersForLibrary writes).
+// Serialize the forwarder title_id -> disc_path map to forwarders.json.
 bool WriteForwarderMap(const std::vector<ForwarderMapEntry>& entries)
 {
   picojson::array rows;
@@ -149,7 +167,6 @@ bool WriteForwarderMap(const std::vector<ForwarderMapEntry>& entries)
     row["game_id"] = picojson::value(e.game_id);
     row["revision"] = picojson::value(static_cast<double>(e.revision));
     row["disc_path"] = picojson::value(e.disc_path);
-    row["long_name"] = picojson::value(e.long_name);
     rows.emplace_back(std::move(row));
   }
   picojson::object doc;
@@ -220,33 +237,47 @@ constexpr size_t IMET_TITLES_OFFSET = 0x5C;
 constexpr size_t IMET_TITLES_SIZE = 0x348;  // 10 langs * 42 * sizeof(char16_t)
 constexpr size_t IMET_MD5_OFFSET = 0x5F0;
 
-// A known-good "donor" channel banner (captured from a menu-safe game). We reuse
-// its asset payload (icon/banner/sound) verbatim and only patch in per-game title
-// text, so a quirky disc banner can never crash the System Menu's grid renderer.
-// Loaded once from the user dir; null if missing/invalid.
+// A known-good "donor" channel banner (captured from a menu-safe game). We reuse its asset
+// payload (icon/banner/sound) and only swap in per-game art + title text, so a quirky disc
+// banner can never crash the System Menu's grid renderer. The donor is load-bearing: without
+// it, no safe banner can be built and games are skipped (never rendered verbatim). It is
+// loaded lazily from the user dir and can be populated by EnsureDonorBanner (auto-capture).
+std::optional<std::vector<u8>> s_donor_banner;
+std::mutex s_donor_mutex;
+bool s_donor_loaded = false;
+
+std::string DonorBannerPath()
+{
+  return File::GetUserPath(D_USER_IDX) + "forwarder_donor.bnr";
+}
+
+std::optional<std::vector<u8>> ReadDonorBannerFile()
+{
+  std::ifstream file(DonorBannerPath(), std::ios::binary | std::ios::ate);
+  if (!file)
+    return std::nullopt;
+  const std::streamoff size = file.tellg();
+  file.seekg(0);
+  std::vector<u8> data(static_cast<size_t>(size > 0 ? size : 0));
+  if (size < static_cast<std::streamoff>(IMET_HEADER_SIZE + 4) ||
+      !file.read(reinterpret_cast<char*>(data.data()), size) || data[0x40] != 'I' ||
+      data[0x41] != 'M' || data[0x42] != 'E' || data[0x43] != 'T')
+  {
+    WARN_LOG_FMT(IOS_ES, "Forwarder: donor banner at {} is missing/invalid", DonorBannerPath());
+    return std::nullopt;
+  }
+  return data;
+}
+
 const std::vector<u8>* GetDonorBanner()
 {
-  static const std::optional<std::vector<u8>> s_donor = []() -> std::optional<std::vector<u8>> {
-    const std::string path = File::GetUserPath(D_USER_IDX) + "forwarder_donor.bnr";
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file)
-    {
-      ERROR_LOG_FMT(IOS_ES, "Forwarder: donor banner not found at {}", path);
-      return std::nullopt;
-    }
-    const std::streamoff size = file.tellg();
-    file.seekg(0);
-    std::vector<u8> data(static_cast<size_t>(size > 0 ? size : 0));
-    if (size < static_cast<std::streamoff>(IMET_HEADER_SIZE + 4) ||
-        !file.read(reinterpret_cast<char*>(data.data()), size) || data[0x40] != 'I' ||
-        data[0x41] != 'M' || data[0x42] != 'E' || data[0x43] != 'T')
-    {
-      ERROR_LOG_FMT(IOS_ES, "Forwarder: donor banner at {} is missing/invalid", path);
-      return std::nullopt;
-    }
-    return data;
-  }();
-  return s_donor ? &*s_donor : nullptr;
+  std::lock_guard<std::mutex> lock(s_donor_mutex);
+  if (!s_donor_loaded)
+  {
+    s_donor_loaded = true;
+    s_donor_banner = ReadDonorBannerFile();
+  }
+  return s_donor_banner ? &*s_donor_banner : nullptr;
 }
 
 // Games whose disc opening.bnr crashes the System Menu's channel-grid renderer when
@@ -323,6 +354,55 @@ std::optional<std::vector<u8>> BuildSafeBanner(const DiscIO::Volume& volume,
     return std::nullopt;
 
   return banner;
+}
+
+// Games whose opening.bnr is known to render safely as a channel banner, used to bootstrap
+// the donor scene. (Mario Kart Wii, Wii Sports / Resort, New Super Mario Bros. Wii.)
+const std::set<std::string> KNOWN_SAFE_DONOR_GAMES = {
+    "RMCE01", "RMCP01", "RMCJ01", "RMCK01",            // Mario Kart Wii
+    "RZTE01", "RZTP01", "RZTJ01", "RZTK01", "RZTW01",  // Wii Sports Resort
+    "RSPE01", "RSPP01", "RSPJ01", "RSPK01",            // Wii Sports
+    "SMNE01", "SMNP01", "SMNJ01", "SMNK01", "SMNW01",  // New Super Mario Bros. Wii
+};
+
+// If no donor banner exists yet, capture one from a known-safe game in the library and
+// populate the cache. This bootstraps the crash-proof banner pipeline on a fresh install
+// using the user's own disc data locally -- no copyrighted art is bundled or redistributed.
+// Without a donor, InstallForwarder skips games (never renders a banner verbatim), so this
+// is what makes tiles appear at all on first run.
+void EnsureDonorBanner(const std::vector<std::string>& disc_paths)
+{
+  if (GetDonorBanner())
+    return;  // already have a valid donor
+  for (const std::string& path : disc_paths)
+  {
+    const std::unique_ptr<DiscIO::Volume> volume = DiscIO::CreateVolume(path);
+    if (!volume || volume->GetVolumeType() != DiscIO::Platform::WiiDisc)
+      continue;
+    const DiscIO::Partition partition = volume->GetGamePartition();
+    if (!KNOWN_SAFE_DONOR_GAMES.count(volume->GetGameID(partition)))
+      continue;
+    const std::optional<std::vector<u8>> bnr = ReadFullBanner(*volume, partition);
+    if (!bnr)
+      continue;
+    {
+      std::ofstream out(DonorBannerPath(), std::ios::binary | std::ios::trunc);
+      if (!out)
+        return;
+      out.write(reinterpret_cast<const char*>(bnr->data()),
+                static_cast<std::streamsize>(bnr->size()));
+    }
+    {
+      std::lock_guard<std::mutex> lock(s_donor_mutex);  // populate cache so it's seen now
+      s_donor_banner = bnr;
+      s_donor_loaded = true;
+    }
+    INFO_LOG_FMT(IOS_ES, "Forwarder: captured donor banner from {}",
+                 volume->GetGameID(partition));
+    return;
+  }
+  WARN_LOG_FMT(IOS_ES, "Forwarder: no known-safe game in the library to capture a donor "
+                       "banner from; tiles are skipped until a donor exists");
 }
 
 std::vector<u8> BuildForwarderTicket(u64 title_id, const std::array<u8, 16>& enc_title_key)
@@ -404,6 +484,10 @@ void RepackWiiMenuChannelLayout(const std::vector<ForwarderMapEntry>& desired)
     if (IsForwarderTitle(e.title_id))
       fwd.emplace(static_cast<u32>(e.title_id & 0xFFFFFFFFu), e.game_id);
 
+  // Snapshot the original bytes so we can skip the write (and avoid churning a brick-sensitive
+  // NAND file) when the repacked layout is byte-identical to what's already on disk.
+  const std::vector<u8> original = d;
+
   // Walk the current grid: keep non-forwarder channels (Disc/Mii/WiiWare/...) in order;
   // collect installed forwarders (dropping any stale tile whose game is no longer present).
   std::vector<std::array<u8, INFO>> others;
@@ -469,10 +553,12 @@ void RepackWiiMenuChannelLayout(const std::vector<ForwarderMapEntry>& desired)
     ++slot;
   }
 
-  // Recompute the MD5 over [0, 0x4B0) and write the file back.
+  // Recompute the MD5 over [0, 0x4B0) and write the file back -- unless nothing changed.
   std::array<u8, 16> digest{};
   mbedtls_md5_ret(d.data(), MD5_OFF, digest.data());
   std::copy(digest.begin(), digest.end(), d.begin() + MD5_OFF);
+  if (d == original)
+    return;  // already packed correctly; skip the redundant write
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
   if (!out)
     return;
@@ -573,33 +659,11 @@ std::optional<std::string> LookupForwarderDiscPath(u64 title_id)
   std::lock_guard<std::mutex> lock(s_forwarder_map_mutex);
   if (!s_forwarder_map_loaded)
   {
-    // Mark loaded even on failure so we don't re-hit the disk on every launch.
+    // Mark loaded even on failure so we don't re-hit the disk on every launch. Reuse the
+    // single full parser (which guards title_id parsing) and project to title_id -> path.
     s_forwarder_map_loaded = true;
-    const std::string path = File::GetUserPath(D_USER_IDX) + "forwarders.json";
-    picojson::value root;
-    std::string error;
-    if (JsonFromFile(path, &root, &error) && root.is<picojson::object>())
-    {
-      const picojson::object& obj = root.get<picojson::object>();
-      const auto forwarders = obj.find("forwarders");
-      if (forwarders != obj.end() && forwarders->second.is<picojson::array>())
-      {
-        for (const picojson::value& entry : forwarders->second.get<picojson::array>())
-        {
-          if (!entry.is<picojson::object>())
-            continue;
-          const picojson::object& row = entry.get<picojson::object>();
-          const std::optional<std::string> tid = ReadStringFromJson(row, "title_id");
-          const std::optional<std::string> disc = ReadStringFromJson(row, "disc_path");
-          if (tid && disc)
-            s_forwarder_map.emplace(std::stoull(*tid, nullptr, 16), *disc);
-        }
-      }
-    }
-    else if (!error.empty())
-    {
-      WARN_LOG_FMT(IOS_ES, "Forwarder map: failed to parse {}: {}", path, error);
-    }
+    for (const ForwarderMapEntry& e : LoadForwarderMapFull())
+      s_forwarder_map.emplace(e.title_id, e.disc_path);
   }
   const auto it = s_forwarder_map.find(title_id);
   if (it == s_forwarder_map.end())
@@ -647,10 +711,12 @@ std::optional<ForwarderInfo> InstallForwarder(const std::string& disc_path)
   if (!banner && donor)
     banner = BuildSafeBanner(*volume, partition);  // donor scene + game titles only
   if (!banner)
-    banner = ReadFullBanner(*volume, partition);  // no donor configured: last resort
-  if (!banner)
   {
-    WARN_LOG_FMT(IOS_ES, "Forwarder: '{}' ({}) - no usable banner; skipping", disc_path, game_id);
+    // Fail safe: never fall back to the game's verbatim opening.bnr -- that is the
+    // banner-brick path. With no donor we skip the game (no tile) instead. EnsureDonorBanner
+    // (run at the start of the sync) tries to capture a donor so this rarely happens.
+    WARN_LOG_FMT(IOS_ES, "Forwarder: '{}' ({}) - no safe banner (donor missing?); skipping",
+                 disc_path, game_id);
     return std::nullopt;
   }
 
@@ -711,35 +777,6 @@ std::optional<ForwarderInfo> InstallForwarder(const std::string& disc_path)
   return ForwarderInfo{title_id, game_id, revision};
 }
 
-size_t InstallForwardersForLibrary(const std::vector<ForwarderLibraryEntry>& games)
-{
-  picojson::array rows;
-  for (const ForwarderLibraryEntry& game : games)
-  {
-    const std::optional<ForwarderInfo> info = InstallForwarder(game.disc_path);
-    if (!info)
-      continue;
-    picojson::object row;
-    row["title_id"] = picojson::value(fmt::format("{:016x}", info->title_id));
-    row["game_id"] = picojson::value(info->game_id);
-    row["revision"] = picojson::value(static_cast<double>(info->revision));
-    row["disc_path"] = picojson::value(game.disc_path);
-    row["long_name"] = picojson::value(game.long_name);
-    rows.emplace_back(std::move(row));
-  }
-
-  picojson::object doc;
-  doc["version"] = picojson::value(1.0);
-  doc["forwarders"] = picojson::value(rows);
-  const std::string path = File::GetUserPath(D_USER_IDX) + "forwarders.json";
-  if (!JsonToFile(path, picojson::value(doc), true))
-    ERROR_LOG_FMT(IOS_ES, "Forwarder: failed to write map {}", path);
-
-  ReloadForwarderMap();
-  INFO_LOG_FMT(IOS_ES, "Forwarder sync: installed {} of {} games", rows.size(), games.size());
-  return rows.size();
-}
-
 bool UninstallForwarder(u64 title_id)
 {
   // Never touch anything outside our forwarder namespace.
@@ -769,6 +806,10 @@ ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& cu
     return result;
   }
   const Common::ScopeGuard running_guard{[] { s_forwarder_sync_running.store(false); }};
+
+  // Phase 0: make sure a donor banner exists (capture one from a known-safe game if not), so
+  // the crash-proof banner pipeline has a host scene. Without it, games are skipped, not bricked.
+  EnsureDonorBanner(current_disc_paths);
 
   // Phase 1: the existing map is the authoritative "installed" set.
   const std::vector<ForwarderMapEntry> old_entries = LoadForwarderMapFull();
@@ -839,15 +880,18 @@ ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& cu
     // being rebuilt), just re-record it; otherwise build + import it (the expensive path).
     if (File::Exists(Common::GetTMDFileName(tid)))
     {
-      desired.push_back({tid, game_id, revision, path, std::string{}});
+      desired.push_back({tid, game_id, revision, path});
       desired_tids.insert(tid);
       ++result.already_present;
       continue;
     }
     const std::optional<ForwarderInfo> info = InstallForwarder(path);
     if (!info)
+    {
+      ++result.failed;
       continue;
-    desired.push_back({info->title_id, info->game_id, info->revision, path, std::string{}});
+    }
+    desired.push_back({info->title_id, info->game_id, info->revision, path});
     desired_tids.insert(info->title_id);
     ++result.installed;
   }
@@ -889,9 +933,10 @@ ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& cu
   // menu safely falls back to its own layout if the file is ever malformed.
   RepackWiiMenuChannelLayout(desired);
 
-  INFO_LOG_FMT(IOS_ES, "Forwarder sync: installed={} moved={} present={} uninstalled={} (map {})",
+  INFO_LOG_FMT(IOS_ES,
+               "Forwarder sync: installed={} moved={} present={} uninstalled={} failed={} (map {})",
                result.installed, result.moved, result.already_present, result.uninstalled,
-               result.map_modified ? "updated" : "unchanged");
+               result.failed, result.map_modified ? "updated" : "unchanged");
   return result;
 }
 

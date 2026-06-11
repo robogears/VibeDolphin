@@ -14,7 +14,6 @@
 #include <mbedtls/md5.h>
 
 #include "Common/Align.h"
-#include "Common/ColorUtil.h"
 #include "Common/CommonTypes.h"
 #include "Common/Logging/Log.h"
 
@@ -51,6 +50,15 @@ constexpr u32 U8_MAGIC = 0x55AA382D;
 constexpr u32 TPL_MAGIC = 0x0020AF30;
 constexpr u32 LZ77_MAGIC = 0x4C5A3737;  // "LZ77"
 constexpr size_t IMD5_HEADER_SIZE = 0x20;
+
+// IMET banner layout (offsets within an opening.bnr / channel banner; see WiiUtils.cpp).
+constexpr size_t IMET_SIZE = 0x600;       // header size; the outer U8 archive follows it
+constexpr size_t IMET_TITLES_OFF = 0x5C;  // 10-language title block
+constexpr size_t IMET_TITLES_LEN = 0x348;
+constexpr size_t IMET_MD5_OFF = 0x5F0;  // MD5 over [0, IMET_SIZE) with this field zeroed
+// IMET fields recording each meta file's byte size (must match the outer U8 entries).
+constexpr std::array<std::pair<const char*, size_t>, 3> IMET_META_SIZE_FIELDS = {
+    {{"icon.bin", 0x4C}, {"banner.bin", 0x50}, {"sound.bin", 0x54}}};
 
 // TPL texture format codes (libtpl / GC-Wii).
 enum : u32
@@ -96,6 +104,14 @@ size_t TextureDataSize(u32 format, u32 w, u32 h)
 }
 
 // 5/6-bit -> 8-bit expansion by bit replication (matches Dolphin's LookUpTables).
+constexpr u8 Conv3To8(u8 v)
+{
+  return static_cast<u8>((v << 5) | (v << 2) | (v >> 1));
+}
+constexpr u8 Conv4To8(u8 v)
+{
+  return static_cast<u8>((v << 4) | v);
+}
 constexpr u8 Conv5To8(u8 v)
 {
   return static_cast<u8>((v << 3) | (v >> 2));
@@ -103,6 +119,16 @@ constexpr u8 Conv5To8(u8 v)
 constexpr u8 Conv6To8(u8 v)
 {
   return static_cast<u8>((v << 2) | (v >> 4));
+}
+
+// RGB5A3 stores opaque pixels as 555 (top bit set) and translucent ones as 4443. On encode,
+// alpha at/above this threshold is treated as opaque (matches the libtpl reference: a 3-bit
+// alpha of 7 -> 255, i.e. anything rounding to fully opaque uses the 555 path).
+constexpr u8 RGB5A3_OPAQUE_THRESHOLD = 0xDA;
+// Round-to-nearest quantization of an 8-bit channel to `bits` (e.g. 5/4/3-bit fields).
+constexpr u8 QuantizeTo(u32 v8, u32 max)
+{
+  return static_cast<u8>((v8 * max + 127) / 255);
 }
 
 bool CanEncode(u32 format)
@@ -115,7 +141,7 @@ bool CanDecode(u32 format)
 }
 
 // ---------------------------------------------------------------------------
-// Pixel buffers are u32 0xAARRGGBB (matching Common::Decode5A3Image and libtpl).
+// Pixel buffers are u32 0xAARRGGBB, with true per-pixel alpha preserved end-to-end.
 // ---------------------------------------------------------------------------
 struct Image
 {
@@ -138,9 +164,32 @@ std::optional<Image> DecodeTexture(u32 format, u32 w, u32 h, const u8* data, siz
 
   if (format == FMT_RGB5A3)
   {
-    std::vector<u16> src(size_t{aw} * ah);
-    std::memcpy(src.data(), data, src.size() * sizeof(u16));
-    Common::Decode5A3Image(padded.data(), src.data(), static_cast<int>(aw), static_cast<int>(ah));
+    // Decode locally (NOT Common::Decode5A3Image, which discards alpha by pre-blending
+    // translucent pixels against black) so the game's transparency survives the round-trip.
+    size_t s = 0;
+    for (u32 y = 0; y < ah; y += 4)
+      for (u32 x = 0; x < aw; x += 4)
+        for (u32 iy = 0; iy < 4; ++iy)
+          for (u32 ix = 0; ix < 4; ++ix, s += 2)
+          {
+            const u16 v = static_cast<u16>((data[s] << 8) | data[s + 1]);
+            u32 r, g, b, a;
+            if (v & 0x8000)  // 555 opaque
+            {
+              a = 0xFF;
+              r = Conv5To8((v >> 10) & 0x1F);
+              g = Conv5To8((v >> 5) & 0x1F);
+              b = Conv5To8(v & 0x1F);
+            }
+            else  // 4443 translucent
+            {
+              a = Conv3To8((v >> 12) & 0x7);
+              r = Conv4To8((v >> 8) & 0xF);
+              g = Conv4To8((v >> 4) & 0xF);
+              b = Conv4To8(v & 0xF);
+            }
+            padded[(y + iy) * aw + (x + ix)] = (a << 24) | (r << 16) | (g << 8) | b;
+          }
   }
   else if (format == FMT_RGB565)
   {
@@ -253,12 +302,12 @@ std::vector<u8> EncodeTexture(u32 format, const Image& img)
             const u32 a = (c >> 24) & 0xFF, r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF,
                       b = c & 0xFF;
             u16 v;
-            if (a <= 0xDA)  // 4443 (translucent) — libtpl threshold
-              v = static_cast<u16>(((a * 7 / 255) << 12) | ((r * 15 / 255) << 8) |
-                                   ((g * 15 / 255) << 4) | (b * 15 / 255));
+            if (a <= RGB5A3_OPAQUE_THRESHOLD)  // 4443 (translucent)
+              v = static_cast<u16>((QuantizeTo(a, 7) << 12) | (QuantizeTo(r, 15) << 8) |
+                                   (QuantizeTo(g, 15) << 4) | QuantizeTo(b, 15));
             else  // 555 opaque
-              v = static_cast<u16>(0x8000 | ((r * 31 / 255) << 10) | ((g * 31 / 255) << 5) |
-                                   (b * 31 / 255));
+              v = static_cast<u16>(0x8000 | (QuantizeTo(r, 31) << 10) | (QuantizeTo(g, 31) << 5) |
+                                   QuantizeTo(b, 31));
             out[z] = static_cast<u8>(v >> 8);
             out[z + 1] = static_cast<u8>(v);
           }
@@ -582,92 +631,104 @@ std::optional<std::string> LargestTpl(std::vector<U8Node>& scene)
   return best;
 }
 
+// A banner meta-file (icon.bin/banner.bin) opened down to its primary texture: the parsed
+// inner scene (owned), the LZ wrapper it used, and the largest TPL's name + texture info.
+struct BannerScene
+{
+  std::vector<U8Node> nodes;
+  LzVariant variant;
+  std::string tpl_name;
+  TplTexture tex;
+};
+
+// Unwrap IMD5 -> decompress -> parse U8 -> locate the largest TPL and its primary texture.
+// Returns the scene by value; re-resolve the node with FindFile(scene.nodes, scene.tpl_name)
+// rather than holding a pointer (the vector is moved into the result).
+std::optional<BannerScene> OpenBannerScene(const std::vector<u8>& file)
+{
+  const auto payload = Imd5Payload(file);
+  if (!payload)
+    return std::nullopt;
+  LzVariant variant;
+  const auto scene_bytes = LzDecompress(*payload, &variant);
+  if (!scene_bytes)
+    return std::nullopt;
+  auto nodes = U8Parse(*scene_bytes);
+  if (!nodes)
+    return std::nullopt;
+  const auto tpl_name = LargestTpl(*nodes);
+  if (!tpl_name)
+    return std::nullopt;
+  const U8Node* node = FindFile(*nodes, *tpl_name);
+  if (!node)
+    return std::nullopt;
+  const auto tex = TplPrimaryTexture(node->data);
+  if (!tex)
+    return std::nullopt;
+  return BannerScene{std::move(*nodes), variant, *tpl_name, *tex};
+}
+
 // Re-host the game's primary texture art into one donor banner file (icon.bin or
 // banner.bin). Keeps the donor scene byte-identical except the primary texture's pixels.
 // Returns the rebuilt donor file bytes, or nullopt to leave the donor file unchanged.
 std::optional<std::vector<u8>> SwapArtIntoFile(const std::vector<u8>& donor_file,
                                                const std::vector<u8>& game_file)
 {
-  // Donor: unwrap -> decompress -> scene; find target texture slot.
-  const auto donor_payload = Imd5Payload(donor_file);
-  if (!donor_payload)
+  std::optional<BannerScene> donor = OpenBannerScene(donor_file);
+  if (!donor || !CanEncode(donor->tex.format))
     return std::nullopt;
-  LzVariant variant;
-  const auto donor_scene_bytes = LzDecompress(*donor_payload, &variant);
-  if (!donor_scene_bytes)
-    return std::nullopt;
-  auto donor_scene = U8Parse(*donor_scene_bytes);
-  if (!donor_scene)
-    return std::nullopt;
-  const auto donor_tpl_name = LargestTpl(*donor_scene);
-  if (!donor_tpl_name)
-    return std::nullopt;
-  U8Node* donor_tpl_node = FindFile(*donor_scene, *donor_tpl_name);
-  const auto donor_tex = TplPrimaryTexture(donor_tpl_node->data);
-  if (!donor_tex || !CanEncode(donor_tex->format))
+  std::optional<BannerScene> game = OpenBannerScene(game_file);
+  if (!game || !CanDecode(game->tex.format))
     return std::nullopt;
 
-  // Game: unwrap -> decompress -> scene; decode its primary texture art.
-  const auto game_payload = Imd5Payload(game_file);
-  if (!game_payload)
+  // Decode the game's art (re-resolve the node from the owned scene -- no dangling pointer).
+  const U8Node* game_tpl = FindFile(game->nodes, game->tpl_name);
+  if (!game_tpl)
     return std::nullopt;
-  LzVariant gvar;
-  const auto game_scene_bytes = LzDecompress(*game_payload, &gvar);
-  if (!game_scene_bytes)
-    return std::nullopt;
-  auto game_scene = U8Parse(*game_scene_bytes);
-  if (!game_scene)
-    return std::nullopt;
-  const auto game_tpl_name = LargestTpl(*game_scene);
-  if (!game_tpl_name)
-    return std::nullopt;
-  U8Node* game_tpl_node = FindFile(*game_scene, *game_tpl_name);
-  const auto game_tex = TplPrimaryTexture(game_tpl_node->data);
-  if (!game_tex || !CanDecode(game_tex->format))
-    return std::nullopt;
-  const auto art = DecodeTexture(game_tex->format, game_tex->width, game_tex->height,
-                                 game_tpl_node->data.data() + game_tex->data_offset,
-                                 game_tex->data_size);
+  const auto art = DecodeTexture(game->tex.format, game->tex.width, game->tex.height,
+                                 game_tpl->data.data() + game->tex.data_offset, game->tex.data_size);
   if (!art)
     return std::nullopt;
 
   // Resize to the donor slot and encode into the donor's format; must match byte size.
-  const Image resized = ResizeImage(*art, donor_tex->width, donor_tex->height);
-  const std::vector<u8> encoded = EncodeTexture(donor_tex->format, resized);
-  if (encoded.size() != donor_tex->data_size)
+  const Image resized = ResizeImage(*art, donor->tex.width, donor->tex.height);
+  const std::vector<u8> encoded = EncodeTexture(donor->tex.format, resized);
+  if (encoded.size() != donor->tex.data_size)
     return std::nullopt;
 
-  // Overwrite donor TPL pixels in place (file size unchanged), repack the scene, re-frame
-  // as all-literal LZ10 in the donor's wrapper, and re-wrap IMD5.
-  std::copy(encoded.begin(), encoded.end(),
-            donor_tpl_node->data.begin() + donor_tex->data_offset);
-  const std::vector<u8> new_scene = U8Build(*donor_scene);
-  return Imd5Wrap(LzCompressAllLiteral(new_scene, variant));
+  // Overwrite the donor TPL pixels in place (size unchanged), repack, re-frame as all-literal
+  // LZ10 in the donor's wrapper, and re-wrap IMD5.
+  U8Node* donor_tpl = FindFile(donor->nodes, donor->tpl_name);
+  if (!donor_tpl)
+    return std::nullopt;
+  std::copy(encoded.begin(), encoded.end(), donor_tpl->data.begin() + donor->tex.data_offset);
+  const std::vector<u8> new_scene = U8Build(donor->nodes);
+  return Imd5Wrap(LzCompressAllLiteral(new_scene, donor->variant));
 }
 
 // Patch the game's IMET title block (10 langs) into a banner, leaving everything else.
 void PatchTitles(std::vector<u8>& banner, const std::vector<u8>& game_bnr)
 {
-  constexpr size_t TITLES_OFF = 0x5C, TITLES_LEN = 0x348;
   if (InBounds(game_bnr, 0x40, 4) && std::memcmp(game_bnr.data() + 0x40, "IMET", 4) == 0 &&
-      InBounds(game_bnr, TITLES_OFF, TITLES_LEN) && InBounds(banner, TITLES_OFF, TITLES_LEN))
+      InBounds(game_bnr, IMET_TITLES_OFF, IMET_TITLES_LEN) &&
+      InBounds(banner, IMET_TITLES_OFF, IMET_TITLES_LEN))
   {
-    std::copy(game_bnr.begin() + TITLES_OFF, game_bnr.begin() + TITLES_OFF + TITLES_LEN,
-              banner.begin() + TITLES_OFF);
+    std::copy(game_bnr.begin() + IMET_TITLES_OFF,
+              game_bnr.begin() + IMET_TITLES_OFF + IMET_TITLES_LEN,
+              banner.begin() + IMET_TITLES_OFF);
   }
 }
 
-// Recompute the IMET MD5 over [0, 0x600) with the 16-byte field zeroed (matches the
+// Recompute the IMET MD5 over [0, IMET_SIZE) with the 16-byte field zeroed (matches the
 // known-good donor convention).
 void FixImetMd5(std::vector<u8>& banner)
 {
-  constexpr size_t MD5_OFF = 0x5F0, IMET_SIZE = 0x600;
   if (!InBounds(banner, 0, IMET_SIZE))
     return;
-  std::fill_n(banner.begin() + MD5_OFF, 16, u8{0});
+  std::fill_n(banner.begin() + IMET_MD5_OFF, 16, u8{0});
   std::array<u8, 16> digest{};
   mbedtls_md5_ret(banner.data(), IMET_SIZE, digest.data());
-  std::copy(digest.begin(), digest.end(), banner.begin() + MD5_OFF);
+  std::copy(digest.begin(), digest.end(), banner.begin() + IMET_MD5_OFF);
 }
 
 // Structural validation of a finished banner: IMET + outer U8 present, the three meta
@@ -675,7 +736,6 @@ void FixImetMd5(std::vector<u8>& banner)
 // icon/banner re-parses (IMD5 -> LZ -> U8 -> TPL). Guards against shipping a brick.
 bool Validate(const std::vector<u8>& banner)
 {
-  constexpr size_t IMET_SIZE = 0x600;
   if (!InBounds(banner, 0x40, 4) || std::memcmp(banner.data() + 0x40, "IMET", 4) != 0)
     return false;
   if (banner.size() <= IMET_SIZE)
@@ -684,9 +744,7 @@ bool Validate(const std::vector<u8>& banner)
   auto nodes = U8Parse(outer);
   if (!nodes)
     return false;
-  const std::array<std::pair<const char*, size_t>, 3> metas = {
-      {{"icon.bin", 0x4C}, {"banner.bin", 0x50}, {"sound.bin", 0x54}}};
-  for (const auto& [name, size_off] : metas)
+  for (const auto& [name, size_off] : IMET_META_SIZE_FIELDS)
   {
     const U8Node* n = nullptr;
     for (const auto& node : *nodes)
@@ -752,13 +810,13 @@ std::vector<u8> MakeTestBanner(u32 format, u32 w, u32 h, u32 color, u8 title_byt
   outer.push_back({false, "sound.bin", 0, 0, sound});
   const std::vector<u8> outer_arc = U8Build(outer);
 
-  std::vector<u8> banner(0x600, 0);
+  std::vector<u8> banner(IMET_SIZE, 0);
   std::memcpy(banner.data() + 0x40, "IMET", 4);
   WU32(banner, 0x48, 3);
   WU32(banner, 0x4C, static_cast<u32>(icon.size()));   // icon.bin size
   WU32(banner, 0x50, static_cast<u32>(icon.size()));   // banner.bin size
   WU32(banner, 0x54, static_cast<u32>(sound.size()));  // sound.bin size
-  std::fill_n(banner.begin() + 0x5C, 0x348, title_byte);
+  std::fill_n(banner.begin() + IMET_TITLES_OFF, IMET_TITLES_LEN, title_byte);
   banner.insert(banner.end(), outer_arc.begin(), outer_arc.end());
   return banner;
 }
@@ -767,7 +825,6 @@ std::vector<u8> MakeTestBanner(u32 format, u32 w, u32 h, u32 color, u8 title_byt
 std::optional<std::vector<u8>> BuildArtChannelBanner(const std::vector<u8>& donor_banner,
                                                      const std::vector<u8>& game_opening_bnr)
 {
-  constexpr size_t IMET_SIZE = 0x600;
   if (!InBounds(donor_banner, 0x40, 4) || std::memcmp(donor_banner.data() + 0x40, "IMET", 4) != 0 ||
       donor_banner.size() <= IMET_SIZE)
   {
@@ -814,8 +871,7 @@ std::optional<std::vector<u8>> BuildArtChannelBanner(const std::vector<u8>& dono
   const std::vector<u8> new_outer = U8Build(*donor_outer);
   std::vector<u8> result(donor_banner.begin(), donor_banner.begin() + IMET_SIZE);
   PatchTitles(result, game_opening_bnr);
-  for (const auto& [name, off] : std::array<std::pair<const char*, size_t>, 3>{
-           {{"icon.bin", 0x4C}, {"banner.bin", 0x50}, {"sound.bin", 0x54}}})
+  for (const auto& [name, off] : IMET_META_SIZE_FIELDS)
   {
     if (const U8Node* n = FindFile(*donor_outer, name))
       WU32(result, off, static_cast<u32>(n->data.size()));
@@ -845,6 +901,18 @@ bool RunSelfTests()
       if (!back || *back != raw || got != v)
       {
         ERROR_LOG_FMT(IOS_ES, "Banner self-test: LZ10 round-trip failed");
+        return false;
+      }
+    }
+    // Uncompressed variant: the payload IS a (U8-magic-prefixed) archive, passed through.
+    {
+      std::vector<u8> u8raw{0x55, 0xAA, 0x38, 0x2D};  // U8_MAGIC, detected by LzDecompress
+      u8raw.insert(u8raw.end(), raw.begin(), raw.end());
+      LzVariant got;
+      const auto back = LzDecompress(LzCompressAllLiteral(u8raw, LzVariant::Uncompressed), &got);
+      if (!back || *back != u8raw || got != LzVariant::Uncompressed)
+      {
+        ERROR_LOG_FMT(IOS_ES, "Banner self-test: LZ uncompressed round-trip failed");
         return false;
       }
     }
@@ -905,6 +973,38 @@ bool RunSelfTests()
       return false;
     }
   }
+  // RGB5A3 must preserve translucency (regression guard: a translucent pixel must NOT decode
+  // back as fully opaque, which was the old Common::Decode5A3Image behavior).
+  {
+    Image img;
+    img.w = 4;
+    img.h = 4;
+    img.px.assign(16, 0x40C0A080u);  // alpha 0x40 -> 4443 path
+    const auto enc = EncodeTexture(FMT_RGB5A3, img);
+    const auto dec = DecodeTexture(FMT_RGB5A3, 4, 4, enc.data(), enc.size());
+    if (!dec || ((dec->px[0] >> 24) & 0xFF) >= 0xFF)
+    {
+      ERROR_LOG_FMT(IOS_ES, "Banner self-test: RGB5A3 translucency not preserved");
+      return false;
+    }
+  }
+  // RGB565 decode (hand-built bytes, since we don't encode RGB565): a solid 4x4 tile.
+  {
+    std::vector<u8> data(TextureDataSize(FMT_RGB565, 4, 4), 0);  // 32 bytes
+    const u16 px = static_cast<u16>((0x18 << 11) | (0x30 << 5) | 0x10);
+    for (size_t i = 0; i + 1 < data.size(); i += 2)
+    {
+      data[i] = static_cast<u8>(px >> 8);
+      data[i + 1] = static_cast<u8>(px);
+    }
+    const auto dec = DecodeTexture(FMT_RGB565, 4, 4, data.data(), data.size());
+    const u32 expect = 0xFF000000u | (Conv5To8(0x18) << 16) | (Conv6To8(0x30) << 8) | Conv5To8(0x10);
+    if (!dec || dec->w != 4 || dec->h != 4 || dec->px[0] != expect)
+    {
+      ERROR_LOG_FMT(IOS_ES, "Banner self-test: RGB565 decode failed");
+      return false;
+    }
+  }
   // End-to-end: a fake RGBA8 donor + a fake RGB5A3 game, run the whole pipeline, and prove
   // the result carries the GAME's art in the DONOR's texture slot (not a silent fallback).
   {
@@ -913,12 +1013,13 @@ bool RunSelfTests()
     const std::vector<u8> donor = MakeTestBanner(FMT_RGBA8, 32, 32, donor_color, 0x11);
     const std::vector<u8> game = MakeTestBanner(FMT_RGB5A3, 48, 48, game_color, 0x22);
     const auto result = BuildArtChannelBanner(donor, game);
-    if (!result || result->size() <= 0x600 || (*result)[0x5C] != 0x22)  // titles from game
+    if (!result || result->size() <= IMET_SIZE ||
+        (*result)[IMET_TITLES_OFF] != 0x22)  // titles from game
     {
       ERROR_LOG_FMT(IOS_ES, "Banner self-test: e2e build/titles failed");
       return false;
     }
-    const std::vector<u8> outer(result->begin() + 0x600, result->end());
+    const std::vector<u8> outer(result->begin() + IMET_SIZE, result->end());
     auto nodes = U8Parse(outer);
     U8Node* icon = nodes ? FindFile(*nodes, "icon.bin") : nullptr;
     if (!icon || RU32(*result, 0x4C) != icon->data.size())  // IMET icon size fixed up

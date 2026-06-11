@@ -328,8 +328,8 @@ void MenuBar::AddToolsMenu()
 
   // Label will be set by a NANDRefresh later
   m_boot_sysmenu = tools_menu->addAction(QString{}, this, [this] { emit BootWiiSystemMenu(); });
-  tools_menu->addAction(tr("Sync Wii Menu Channels"), this,
-                        [this] { emit SyncWiiMenuChannels(); });
+  m_sync_wii_menu_channels = tools_menu->addAction(tr("Sync Wii Menu Channels"), this,
+                                                   [this] { emit SyncWiiMenuChannels(); });
   m_wad_install_action = tools_menu->addAction(tr("Install WAD..."), this, &MenuBar::InstallWAD);
   m_manage_nand_menu = tools_menu->addMenu(tr("Manage NAND"));
   m_import_backup = m_manage_nand_menu->addAction(tr("Import BootMii NAND Backup..."), this,
@@ -339,6 +339,7 @@ void MenuBar::AddToolsMenu()
                                                          &MenuBar::NANDExtractCertificates);
 
   m_boot_sysmenu->setEnabled(false);
+  m_sync_wii_menu_channels->setEnabled(false);
 
   connect(&Settings::Instance(), &Settings::NANDRefresh, this,
           [this] { UpdateToolsMenu(Core::State::Uninitialized); });
@@ -1106,6 +1107,7 @@ void MenuBar::UpdateToolsMenu(const Core::State state)
   const bool is_running = state == Core::State::Running || state == Core::State::Paused;
 
   m_boot_sysmenu->setEnabled(is_uninitialized);
+  m_sync_wii_menu_channels->setEnabled(is_uninitialized);
   m_perform_online_update_menu->setEnabled(is_uninitialized);
   m_ntscj_ipl->setEnabled(is_uninitialized && File::Exists(Config::GetBootROMPath(JAP_DIR)));
   m_ntscu_ipl->setEnabled(is_uninitialized && File::Exists(Config::GetBootROMPath(USA_DIR)));
@@ -1134,6 +1136,7 @@ void MenuBar::UpdateToolsMenu(const Core::State state)
     m_boot_sysmenu->setText(sysmenu_text.arg(sysmenu_version));
 
     m_boot_sysmenu->setEnabled(tmd.IsValid());
+    m_sync_wii_menu_channels->setEnabled(tmd.IsValid());  // tiles only render in the System Menu
 
     for (QAction* action : m_perform_online_update_menu->actions())
       action->setEnabled(!tmd.IsValid());

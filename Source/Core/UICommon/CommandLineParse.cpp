@@ -111,11 +111,7 @@ std::unique_ptr<optparse::OptionParser> CreateParser(ParserOptions options)
   parser->add_option("--generate-forwarders")
       .action("store_true")
       .dest("generate_forwarders")
-      .help("(dev) Generate forwarder channels for the game library, then exit");
-  parser->add_option("--test-forwarder-lookup")
-      .action("store_true")
-      .dest("test_forwarder_lookup")
-      .help("(dev) Test the forwarder map lookup, then exit (0=ok,1=miss,2=not-forwarder)");
+      .help("Rebuild Wii Menu channel tiles for the configured game library, then exit");
 
   if (options == ParserOptions::IncludeGUIOptions)
   {

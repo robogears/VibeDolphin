@@ -55,23 +55,15 @@ struct ForwarderInfo
   std::string game_id;
   u16 revision;
 };
-struct ForwarderLibraryEntry
-{
-  std::string disc_path;
-  std::string long_name;
-};
 
 // Deterministic, file-location-independent forwarder title id for a disc identity.
 u64 ComputeForwarderTitleId(const std::string& game_id, u16 revision);
 // True if title_id is in our forwarder-channel namespace.
 bool IsForwarderTitle(u64 title_id);
 
-// Build + install one forwarder for a Wii disc image (uses the disc's own
-// opening.bnr as the banner). Returns its info, or nullopt (non-Wii / no banner).
+// Build + install one forwarder for a Wii disc image (re-hosts the game's art in a safe
+// donor scene). Returns its info, or nullopt (non-Wii / no donor / unreadable banner).
 std::optional<ForwarderInfo> InstallForwarder(const std::string& disc_path);
-// Install forwarders for a whole library and persist the title-id -> path map.
-// Returns the number installed.
-size_t InstallForwardersForLibrary(const std::vector<ForwarderLibraryEntry>& games);
 
 // Remove a forwarder channel from NAND (title dir + ticket). No-op + false for any
 // title id outside our forwarder namespace (never deletes real titles).
@@ -84,6 +76,7 @@ struct ForwarderSyncResult
   size_t moved = 0;
   size_t uninstalled = 0;
   size_t orphaned = 0;
+  size_t failed = 0;  // Wii discs that could not be turned into a tile (e.g. no donor yet)
   bool map_modified = false;
 };
 // Incrementally reconcile installed forwarders with the given set of disc paths:

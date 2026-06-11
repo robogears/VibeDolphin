@@ -24,6 +24,14 @@
 
 #if defined(_MSC_VER)
 
+// Reminder (emitted at compile time): delete this shim once the bundled Qt no longer
+// references stdext (Qt >= 6.6.1) or the build moves to the v143 toolset. The guard is left
+// unconditional on _MSC_VER on purpose -- this header is force-included before any Qt header,
+// so QT_VERSION isn't available to gate on here, and a guessed _MSC_VER lower bound could
+// exclude a toolset that still needs the shim (breaking the Windows build it exists to fix).
+#pragma message(                                                                               \
+    "VibeDolphin: MSVCStdextCompat shim active -- remove when bundled Qt >= 6.6.1 or v143 toolset")
+
 #include <cstddef>
 
 namespace stdext

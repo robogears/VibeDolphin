@@ -500,6 +500,10 @@ bool ESDevice::LaunchPPCTitle(u64 title_id)
       WiiUtils::RequestForwarderBoot(*disc_path);
       return true;
     }
+    // Tile exists but its disc path is gone (game moved/deleted, or the map was edited).
+    // Surface it instead of leaving the menu silently wedged on a no-op launch.
+    PanicAlertFmtT("This game's disc image could not be found.\n\nRun Tools > Sync Wii Menu "
+                   "Channels (or relaunch) after restoring it.");
     WARN_LOG_FMT(IOS_ES, "Forwarder title {:016x} not in map; ignoring launch", title_id);
     return false;
   }

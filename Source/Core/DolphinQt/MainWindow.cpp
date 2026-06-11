@@ -13,6 +13,7 @@
 #include <QFileInfo>
 #include <QIcon>
 #include <QMimeData>
+#include <QSplashScreen>
 #include <QStackedWidget>
 #include <QStyleHints>
 #include <QTimer>
@@ -219,6 +220,21 @@ static std::vector<std::string> StringListToStdVector(const QStringList& list)
   return result;
 }
 
+namespace
+{
+// Temporarily disables the "Confirm on Stop" prompt, restoring the prior value on scope exit
+// (used around the forwarder boot swap and the banner-brick stop so the restore can't be
+// skipped). VibeDolphin helper.
+struct SuppressConfirmOnStop
+{
+  const bool prev = Config::Get(Config::MAIN_CONFIRM_ON_STOP);
+  SuppressConfirmOnStop() { Config::SetCurrent(Config::MAIN_CONFIRM_ON_STOP, false); }
+  ~SuppressConfirmOnStop() { Config::SetCurrent(Config::MAIN_CONFIRM_ON_STOP, prev); }
+  SuppressConfirmOnStop(const SuppressConfirmOnStop&) = delete;
+  SuppressConfirmOnStop& operator=(const SuppressConfirmOnStop&) = delete;
+};
+}  // namespace
+
 MainWindow::MainWindow(Core::System& system, std::unique_ptr<BootParameters> boot_parameters,
                        const std::string& movie_path, bool wii_menu_kiosk)
     : QMainWindow(nullptr), m_system(system)
@@ -320,8 +336,35 @@ MainWindow::MainWindow(Core::System& system, std::unique_ptr<BootParameters> boo
   // force fullscreen for the session.
   if (m_wii_menu_kiosk)
   {
-    Config::SetCurrent(Config::MAIN_FULLSCREEN, true);
-    RunForwarderSyncImpl(/*synchronous=*/true);
+    bool have_system_menu = false;
+    {
+      IOS::HLE::Kernel ios;
+      have_system_menu = ios.GetESCore().FindInstalledTMD(Titles::SYSTEM_MENU).IsValid();
+    }
+    if (!have_system_menu)
+    {
+      // Asked to boot the Wii Menu but none is installed: fall back to the normal interface
+      // with a clear message instead of a generic boot failure.
+      m_wii_menu_kiosk = false;
+      m_pending_boot.reset();
+      ScheduleForwarderAutoSync();
+      ModalMessageBox::warning(
+          this, tr("Wii Menu"),
+          tr("No Wii System Menu is installed.\n\nStarting the normal interface — install a "
+             "System Menu (Tools > Perform Online System Update), then relaunch."));
+    }
+    else
+    {
+      Config::SetCurrent(Config::MAIN_FULLSCREEN, true);
+      // Show a splash so the (possibly multi-second on first run) reconcile doesn't look like a
+      // hang while the window is up but frozen. The sync stays synchronous on the UI thread.
+      QSplashScreen splash(QPixmap(1, 1));
+      splash.showMessage(tr("Updating Wii Menu channels…"), Qt::AlignCenter, Qt::white);
+      splash.show();
+      QApplication::processEvents();
+      RunForwarderSyncImpl(/*synchronous=*/true, /*user_invoked=*/false);
+      splash.close();
+    }
   }
   else
   {
@@ -357,6 +400,11 @@ MainWindow::MainWindow(Core::System& system, std::unique_ptr<BootParameters> boo
 
 MainWindow::~MainWindow()
 {
+  // Finish any in-flight forwarder reconcile before teardown so its NAND writes can't race
+  // Core/UICommon shutdown.
+  if (m_forwarder_sync_thread.joinable())
+    m_forwarder_sync_thread.join();
+
   // Shut down NetPlay first to avoid race condition segfault
   Settings::Instance().ResetNetPlayClient();
   Settings::Instance().ResetNetPlayServer();
@@ -776,10 +824,8 @@ void MainWindow::ConnectHost()
       WiiUtils::SetWiiMenuBootPending(false);
       if (m_wii_menu_brick_timer)
         m_wii_menu_brick_timer->stop();
-      const bool prev_confirm = Config::Get(Config::MAIN_CONFIRM_ON_STOP);
-      Config::SetCurrent(Config::MAIN_CONFIRM_ON_STOP, false);
+      const SuppressConfirmOnStop confirm_guard;
       StartGame(disc_path, ScanForSecondDisc::No);
-      Config::SetCurrent(Config::MAIN_CONFIRM_ON_STOP, prev_confirm);
     });
   });
 }
@@ -1661,8 +1707,12 @@ void MainWindow::BootWiiSystemMenu()
   WiiUtils::SetWiiMenuBootPending(true);
   if (!m_wii_menu_brick_timer)
   {
+    // Poll for a brick flagged on the CPU thread by the panic handler. Polling (vs a
+    // cross-thread signal) deliberately keeps the crash-detection path simple and avoids
+    // running any callback from inside the guest-fault panic handler; 500ms is imperceptible.
+    constexpr int kBrickPollIntervalMs = 500;
     m_wii_menu_brick_timer = new QTimer(this);
-    m_wii_menu_brick_timer->setInterval(500);
+    m_wii_menu_brick_timer->setInterval(kBrickPollIntervalMs);
     connect(m_wii_menu_brick_timer, &QTimer::timeout, this, [this] {
       if (WiiUtils::ConsumeWiiMenuBrickDetected())
         OnWiiMenuBannerBrick();
@@ -1679,10 +1729,10 @@ void MainWindow::OnWiiMenuBannerBrick()
   WiiUtils::SetWiiMenuBootPending(false);
   // Stop the wedged menu without the "confirm stop" prompt; the heal markers are already
   // written, so the next launch (or Tools > Sync Wii Menu Channels) rebuilds safe banners.
-  const bool prev_confirm = Config::Get(Config::MAIN_CONFIRM_ON_STOP);
-  Config::SetCurrent(Config::MAIN_CONFIRM_ON_STOP, false);
-  RequestStop();
-  Config::SetCurrent(Config::MAIN_CONFIRM_ON_STOP, prev_confirm);
+  {
+    const SuppressConfirmOnStop confirm_guard;
+    RequestStop();
+  }
   ModalMessageBox::warning(
       this, tr("Wii Menu"),
       tr("A channel banner crashed the Wii Menu's channel grid.\n\nVibeDolphin has switched to "
@@ -1691,44 +1741,85 @@ void MainWindow::OnWiiMenuBannerBrick()
 
 void MainWindow::RunForwarderSync()
 {
-  RunForwarderSyncImpl(/*synchronous=*/false);
+  // The Tools-menu action: run on a worker thread and report the outcome to the user.
+  RunForwarderSyncImpl(/*synchronous=*/false, /*user_invoked=*/true);
 }
 
-void MainWindow::RunForwarderSyncImpl(bool synchronous)
+void MainWindow::ShowForwarderSyncResult(const WiiUtils::ForwarderSyncResult& result)
+{
+  const bool changed = result.installed || result.uninstalled || result.moved;
+  QString msg = changed ? tr("Wii Menu channels updated: %1 added, %2 removed.")
+                              .arg(result.installed)
+                              .arg(result.uninstalled)
+                        : tr("Wii Menu channels are already up to date.");
+  if (result.failed != 0)
+  {
+    msg += tr("\n\n%1 game(s) could not be added yet (no usable banner / donor).")
+               .arg(result.failed);
+  }
+  ModalMessageBox::information(this, tr("Sync Wii Menu Channels"), msg);
+}
+
+void MainWindow::RunForwarderSyncImpl(bool synchronous, bool user_invoked)
 {
   // Reconcile the Wii Menu's forwarder channels with the game library. Gated so it only
   // runs when idle and a System Menu is installed; the heavy work (disc scan + NAND
-  // import/uninstall) normally runs on a detached worker thread so the UI never blocks
+  // import/uninstall) normally runs on a tracked worker thread so the UI never blocks
   // (the kiosk pre-boot path passes synchronous=true to finish before the menu boots).
   if (!Core::IsUninitialized(m_system))
+  {
+    if (user_invoked)
+    {
+      ModalMessageBox::warning(this, tr("Sync Wii Menu Channels"),
+                               tr("Stop emulation first, then sync the Wii Menu channels."));
+    }
     return;
+  }
   {
     IOS::HLE::Kernel ios;
     if (!ios.GetESCore().FindInstalledTMD(Titles::SYSTEM_MENU).IsValid())
+    {
+      if (user_invoked)
+      {
+        ModalMessageBox::warning(
+            this, tr("Sync Wii Menu Channels"),
+            tr("No Wii System Menu is installed.\n\nInstall one (Tools > Perform Online System "
+               "Update) — the channel tiles render inside it."));
+      }
       return;  // no System Menu -> forwarder tiles can't appear; nothing to sync
+    }
   }
   // Crash self-heal: if a prior session recorded a banner brick, stay in safe-banner mode,
   // and (once, via the one-shot regen marker) rebuild every channel with the plain donor.
   if (WiiUtils::HasSafeBannerMarker())
     WiiUtils::SetSafeBannerMode(true);
   const bool force_reinstall = WiiUtils::ConsumeBannerRegenPending();
-  auto body = [force_reinstall] {
+  auto body = [this, force_reinstall, user_invoked] {
     const std::vector<std::string> dirs = Config::GetIsoPaths();
     const std::vector<std::string_view> dir_views(dirs.begin(), dirs.end());
     const std::vector<std::string> paths = UICommon::FindAllGamePaths(dir_views, true);
-    WiiUtils::SyncForwardersWithLibrary(paths, force_reinstall);
+    const WiiUtils::ForwarderSyncResult result =
+        WiiUtils::SyncForwardersWithLibrary(paths, force_reinstall);
+    if (user_invoked)
+      QueueOnObject(this, [this, result] { ShowForwarderSyncResult(result); });
   };
   if (synchronous)
+  {
     body();
-  else
-    std::thread(std::move(body)).detach();
+    return;
+  }
+  // Tracked thread: join any prior run (usually already finished) before reusing the handle,
+  // and the destructor joins it so a sync never outlives the window / races NAND teardown.
+  if (m_forwarder_sync_thread.joinable())
+    m_forwarder_sync_thread.join();
+  m_forwarder_sync_thread = std::thread(std::move(body));
 }
 
 void MainWindow::ScheduleForwarderAutoSync()
 {
-  // Run the reconcile once per launch, after the main window is up.
+  // Run the reconcile once per launch, silently, after the main window is up.
   static std::once_flag s_once;
-  std::call_once(s_once, [this] { RunForwarderSync(); });
+  std::call_once(s_once, [this] { RunForwarderSyncImpl(/*synchronous=*/false, /*user_invoked=*/false); });
 }
 
 void MainWindow::NetPlayInit()

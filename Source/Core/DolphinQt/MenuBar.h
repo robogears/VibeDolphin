@@ -247,6 +247,7 @@ private:
   QAction* m_frame_advance_action;
   QAction* m_screenshot_action;
   QAction* m_boot_sysmenu;
+  QAction* m_sync_wii_menu_channels;
   QMenu* m_state_load_menu;
   QMenu* m_state_save_menu;
   QMenu* m_state_slot_menu;
