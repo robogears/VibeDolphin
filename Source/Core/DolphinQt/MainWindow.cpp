@@ -1735,7 +1735,10 @@ void MainWindow::OnWiiMenuBannerBrick()
 {
   if (m_wii_menu_brick_timer)
     m_wii_menu_brick_timer->stop();
-  WiiUtils::SetWiiMenuBootPending(false);
+  // Deliberately do NOT clear the boot-pending flag here: a bad banner keeps faulting until the
+  // CPU halts, and keeping the flag set means those flood panics stay suppressed (no dialog spam)
+  // while RequestStop tears the menu down. The Uninitialized state callback clears it once the
+  // menu has actually stopped.
   // Stop the wedged menu without the "confirm stop" prompt; the heal markers are already
   // written, so the next launch (or Tools > Sync Wii Menu Channels) rebuilds safe banners.
   {

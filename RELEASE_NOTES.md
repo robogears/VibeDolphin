@@ -1,12 +1,14 @@
-# What's new in v0.1.9
+# What's new in v0.1.10
 
-Bug fix on top of v0.1.8's real-banner + auto-quarantine model.
+Bug fix on top of v0.1.9.
 
-## The auto-quarantine now actually runs on the Steam Deck
-- **Fixed:** when launched straight into the Wii Menu (the Steam Deck / kiosk path — the normal way you launch it), the crash-detection window was never armed. So a game whose banner crashed the menu was **never detected, never quarantined, and crashed on every boot** (no `wii_menu_quarantine.txt` was written). The detection only worked from the desktop "Tools → Load Wii System Menu" path.
-- Now the kiosk boot arms the same brick watchdog as the menu path: a crashing banner is caught, the game is identified and written to `wii_menu_quarantine.txt`, the menu stops cleanly, and on the next launch that one game becomes the yellow "image not loaded" tile while everything else keeps its real banner.
+## A crashing banner is now caught cleanly (no error flood)
+- A bad banner doesn't always fault just once — it can send the System Menu's renderer into a garbage-pointer loop that spews **hundreds** of memory-fault panics in a row. v0.1.9 caught the crash but only handled the *first* panic well; the flood then (a) leaked raw error dialogs and (b) — because the first panic consumes the "which game" marker — made every following panic think the culprit was unknown and trip the all-tiles-to-placeholder safety fallback.
+- **Fixed:** VibeDolphin now acts on the first brick panic only (records the culprit, quarantines that one game), and **suppresses the entire rest of the flood** while it stops the wedged menu — so you get one clean "a channel banner crashed" notice instead of a wall of errors, and only the actual offending game is quarantined.
 
-Everything else is unchanged from v0.1.8 (real per-game banners, crash-once-to-quarantine, loop-safety backstop, one-time migration).
+After this, a crashing game should: crash once (caught + quarantined silently), then come back as the yellow "image not loaded" tile on the next launch, with every other game keeping its real banner.
+
+Everything else is unchanged from v0.1.8/0.1.9 (real per-game banners, crash-once-to-quarantine, loop-safety backstop, one-time migration).
 
 ---
 
@@ -22,4 +24,4 @@ To reach the normal Dolphin interface (first-time setup or settings), set the St
 
 ---
 
-**Full Changelog**: https://github.com/robogears/VibeDolphin/commits/v0.1.9
+**Full Changelog**: https://github.com/robogears/VibeDolphin/commits/v0.1.10

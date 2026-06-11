@@ -84,9 +84,14 @@ std::atomic<bool> s_forwarder_sync_running{false};
 // s_wii_menu_boot_pending is true only while the emulated System Menu is the running
 // session, so a null-read panic in that window is attributed to the channel grid.
 // s_wii_menu_brick_detected is the in-session flag the frontend polls to stop + notify.
+// s_brick_handled_this_boot makes the first brick panic the only one we ACT on: a bad banner
+// often spews a flood of faults (a garbage-pointer loop), and we must quarantine the culprit
+// exactly once and suppress the rest -- not re-attribute (the marker is consumed on the first
+// read, so re-entry would wrongly trip the "unknown culprit -> blanket safe mode" backstop).
 std::atomic<bool> s_safe_banner_mode{false};
 std::atomic<bool> s_wii_menu_boot_pending{false};
 std::atomic<bool> s_wii_menu_brick_detected{false};
+std::atomic<bool> s_brick_handled_this_boot{false};
 
 // Persistent markers under the user dir: SAFE_MODE makes safe-banner mode sticky across
 // launches; REGEN_PENDING is the one-shot "rebuild now" flag set on a brick.
@@ -669,9 +674,12 @@ bool IsSafeBannerMode()
 void SetWiiMenuBootPending(bool pending)
 {
   // Clear any stale "last banner read" marker when arming, so a brick is attributed only to a
-  // forwarder banner opened during THIS menu boot.
+  // forwarder banner opened during THIS menu boot, and reset the once-per-boot brick guard.
   if (pending)
+  {
     File::Delete(File::GetUserPath(D_USER_IDX) + LAST_BANNER_MARKER);
+    s_brick_handled_this_boot.store(false);
+  }
   s_wii_menu_boot_pending.store(pending);
 }
 
@@ -718,6 +726,12 @@ bool NotePanicMessageMaybeBrick(const char* text)
   {
     return false;
   }
+  // A bad banner can fault repeatedly (a garbage-pointer loop spewing many panics). Act on the
+  // FIRST one only; suppress the rest. Re-entry would consume an already-empty attribution marker
+  // and wrongly trip the "unknown culprit -> blanket safe mode" backstop. Returning true still
+  // suppresses each flood panic's dialog while the watchdog stops the wedged menu.
+  if (s_brick_handled_this_boot.exchange(true))
+    return true;
   const std::string dir = File::GetUserPath(D_USER_IDX);
   // Attribute the crash to the last forwarder banner the menu opened. If we can name the culprit,
   // quarantine ONLY that game (caution tile next launch) and leave every other tile's real art
