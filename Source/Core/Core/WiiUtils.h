@@ -90,7 +90,32 @@ struct ForwarderSyncResult
 // install newly-added games, drop removed ones, follow moved/renamed files, and
 // persist the map only if it changed. Safe to call off the UI thread; runs at most
 // one reconcile at a time (extra concurrent calls return immediately).
-ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& current_disc_paths);
+// If |force_reinstall| is true, every forwarder is uninstalled and rebuilt (used by the
+// crash self-heal to regenerate all banners after switching to safe-banner mode).
+ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& current_disc_paths,
+                                              bool force_reinstall = false);
+
+// --- Wii Menu crash safety net (next-launch self-heal) ---------------------------------
+// When a channel banner bricks the System Menu's grid renderer (a null-read panic), we
+// record it and, on the next launch, rebuild every channel with the plain donor banner so
+// the menu boots cleanly. "Safe-banner mode" forces InstallForwarder to skip per-game art.
+void SetSafeBannerMode(bool enabled);
+bool IsSafeBannerMode();
+// The frontend sets this true while the emulated System Menu is the running session, so a
+// stray "Invalid read" panic during that window is attributed to the channel grid (and not
+// to a normal game, which may legitimately fault).
+void SetWiiMenuBootPending(bool pending);
+// Called from the panic handler. If a Wii Menu boot is pending and |text| is an invalid
+// memory-access panic, this persists the safe-mode + regen markers, flags an in-session
+// brick for the frontend, and returns true so the caller suppresses the dialog spam.
+bool NotePanicMessageMaybeBrick(const char* text);
+// Atomically take the "a brick was just detected this session" flag (frontend polls this).
+bool ConsumeWiiMenuBrickDetected();
+// True if a prior session recorded a banner brick (the persistent safe-mode marker exists).
+bool HasSafeBannerMarker();
+// Atomically consume the one-shot "regenerate all banners" marker (set when a brick was
+// first recorded); true exactly once after a brick, so the heal regen runs a single time.
+bool ConsumeBannerRegenPending();
 
 // Look up a forwarder's disc path (lazy-loads forwarders.json); used by the ES hook.
 std::optional<std::string> LookupForwarderDiscPath(u64 title_id);

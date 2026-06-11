@@ -53,6 +53,7 @@
 #include "Core/IOS/Uids.h"
 #include "Core/SysConf.h"
 #include "Core/System.h"
+#include "Core/WiiBanner.h"
 #include "DiscIO/DiscExtractor.h"
 #include "DiscIO/DiscUtils.h"
 #include "DiscIO/Enums.h"
@@ -77,6 +78,19 @@ bool s_forwarder_map_loaded = false;
 
 // Guards SyncForwardersWithLibrary against re-entrancy / concurrent runs.
 std::atomic<bool> s_forwarder_sync_running{false};
+
+// Crash safety net. s_safe_banner_mode forces plain-donor banners (no per-game art).
+// s_wii_menu_boot_pending is true only while the emulated System Menu is the running
+// session, so a null-read panic in that window is attributed to the channel grid.
+// s_wii_menu_brick_detected is the in-session flag the frontend polls to stop + notify.
+std::atomic<bool> s_safe_banner_mode{false};
+std::atomic<bool> s_wii_menu_boot_pending{false};
+std::atomic<bool> s_wii_menu_brick_detected{false};
+
+// Persistent markers under the user dir: SAFE_MODE makes safe-banner mode sticky across
+// launches; REGEN_PENDING is the one-shot "rebuild every banner now" flag set on a brick.
+const char* const SAFE_MODE_MARKER = "forwarder_safe_mode";
+const char* const REGEN_PENDING_MARKER = "forwarder_regen_pending";
 
 // A full forwarders.json row (the lazy lookup map only retains title_id -> disc_path).
 struct ForwarderMapEntry
@@ -362,6 +376,61 @@ void RequestForwarderBoot(const std::string& disc_path)
     ERROR_LOG_FMT(IOS_ES, "RequestForwarderBoot: no handler registered (disc: {})", disc_path);
 }
 
+void SetSafeBannerMode(bool enabled)
+{
+  s_safe_banner_mode.store(enabled);
+}
+bool IsSafeBannerMode()
+{
+  return s_safe_banner_mode.load();
+}
+void SetWiiMenuBootPending(bool pending)
+{
+  s_wii_menu_boot_pending.store(pending);
+}
+
+bool NotePanicMessageMaybeBrick(const char* text)
+{
+  if (!s_wii_menu_boot_pending.load() || text == nullptr)
+    return false;
+  const std::string_view msg(text);
+  // Memory-access panics carry "PC = 0x..."; match that (plus the English wording) so we
+  // catch the brick regardless of UI translation. Gated on the menu-boot window above, so
+  // a normal game's stray fault is never misattributed.
+  if (msg.find("PC = 0x") == std::string_view::npos &&
+      msg.find("Invalid read") == std::string_view::npos &&
+      msg.find("Invalid write") == std::string_view::npos)
+  {
+    return false;
+  }
+  const std::string dir = File::GetUserPath(D_USER_IDX);
+  File::CreateEmptyFile(dir + SAFE_MODE_MARKER);
+  File::CreateEmptyFile(dir + REGEN_PENDING_MARKER);
+  s_safe_banner_mode.store(true);
+  s_wii_menu_brick_detected.store(true);
+  WARN_LOG_FMT(IOS_ES, "Wii Menu banner brick detected; engaging safe-banner mode for relaunch");
+  return true;
+}
+
+bool ConsumeWiiMenuBrickDetected()
+{
+  return s_wii_menu_brick_detected.exchange(false);
+}
+
+bool HasSafeBannerMarker()
+{
+  return File::Exists(File::GetUserPath(D_USER_IDX) + SAFE_MODE_MARKER);
+}
+
+bool ConsumeBannerRegenPending()
+{
+  const std::string path = File::GetUserPath(D_USER_IDX) + REGEN_PENDING_MARKER;
+  if (!File::Exists(path))
+    return false;
+  File::Delete(path);
+  return true;
+}
+
 u64 ComputeForwarderTitleId(const std::string& game_id, u16 revision)
 {
   // Deterministic, file-location-independent id from the disc's stable identity.
@@ -443,19 +512,23 @@ std::optional<ForwarderInfo> InstallForwarder(const std::string& disc_path)
     return std::nullopt;
   }
 
-  // Prefer the game's own banner (real per-game icon + animation); fall back to the safe
-  // donor tile for banners known to crash the menu, or ones we can't read.
+  // Build the channel banner. The safe path re-hosts the game's own artwork inside a
+  // known-good donor scene (BuildArtChannelBanner): the renderer only ever walks the
+  // donor's BRLYT/BRLAN, so no game's banner can brick the menu, yet each tile shows real
+  // per-game art. Falls back to the plain donor tile if art extraction fails, the game is
+  // explicitly blocklisted, or the banner toolkit's startup self-test didn't pass.
+  static const bool s_banner_tools_ok = Banner::RunSelfTests();
+  const std::vector<u8>* const donor = GetDonorBanner();
   std::optional<std::vector<u8>> banner;
-  if (IsBannerBlocklisted(game_id))
+  if (donor && s_banner_tools_ok && !IsSafeBannerMode() && !IsBannerBlocklisted(game_id))
   {
-    banner = BuildSafeBanner(*volume, partition);
+    if (const std::optional<std::vector<u8>> game_bnr = ReadFullBanner(*volume, partition))
+      banner = Banner::BuildArtChannelBanner(*donor, *game_bnr);
   }
-  else
-  {
-    banner = ReadFullBanner(*volume, partition);
-    if (!banner)
-      banner = BuildSafeBanner(*volume, partition);
-  }
+  if (!banner && donor)
+    banner = BuildSafeBanner(*volume, partition);  // donor scene + game titles only
+  if (!banner)
+    banner = ReadFullBanner(*volume, partition);  // no donor configured: last resort
   if (!banner)
   {
     WARN_LOG_FMT(IOS_ES, "Forwarder: '{}' ({}) - no usable banner; skipping", disc_path, game_id);
@@ -567,7 +640,8 @@ bool UninstallForwarder(u64 title_id)
   return true;
 }
 
-ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& current_disc_paths)
+ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& current_disc_paths,
+                                              bool force_reinstall)
 {
   ForwarderSyncResult result;
   if (s_forwarder_sync_running.exchange(true))
@@ -585,6 +659,21 @@ ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& cu
   {
     old_by_path.emplace(e.disc_path, e);
     old_by_tid.emplace(e.title_id, e);
+  }
+
+  // Force regen (crash self-heal): drop every installed forwarder so each game is rebuilt
+  // from scratch in the current banner mode. Clearing the old maps makes every current path
+  // take the full (re)install path below instead of being kept as-is.
+  if (force_reinstall)
+  {
+    IOS::HLE::Kernel ios;
+    for (const u64 tid : ios.GetESCore().GetInstalledTitles())
+    {
+      if (IsForwarderTitle(tid))
+        UninstallForwarder(tid);
+    }
+    old_by_path.clear();
+    old_by_tid.clear();
   }
 
   // Phases 2-3: classify each current library path into the desired set.

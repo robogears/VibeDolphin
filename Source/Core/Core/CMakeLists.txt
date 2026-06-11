@@ -586,6 +586,8 @@ add_library(core
   USBUtils.h
   WC24PatchEngine.cpp
   WC24PatchEngine.h
+  WiiBanner.cpp
+  WiiBanner.h
   WiiRoot.cpp
   WiiRoot.h
   WiiUtils.cpp

@@ -30,6 +30,7 @@ class CheatsManager;
 class CodeWidget;
 class DiscordHandler;
 class DragEnterEvent;
+class QTimer;
 class FreeLookWindow;
 class GameCount;
 class GameList;
@@ -127,6 +128,9 @@ private:
   void BootWiiSystemMenu();
   void ScheduleForwarderAutoSync();
   void RunForwarderSync();
+  // Invoked when a forwarder channel banner bricks the Wii Menu's grid renderer: stops the
+  // wedged session and tells the user (safe banners are rebuilt on the next launch).
+  void OnWiiMenuBannerBrick();
 
   void PerformOnlineUpdate(const std::string& region);
 
@@ -254,6 +258,9 @@ private:
   bool m_is_screensaver_inhibited = false;
   u32 m_state_slot = 1;
   std::unique_ptr<BootParameters> m_pending_boot;
+  // Polls for a Wii Menu banner brick (flagged on the CPU thread by the panic handler) while
+  // the System Menu is the running session; armed in BootWiiSystemMenu, stopped on stop.
+  QTimer* m_wii_menu_brick_timer = nullptr;
 
   SettingsWindow* m_settings_window = nullptr;
   // m_fifo_window doesn't set MainWindow as its parent so that the fifo can be focused without

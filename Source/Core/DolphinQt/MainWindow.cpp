@@ -15,6 +15,7 @@
 #include <QMimeData>
 #include <QStackedWidget>
 #include <QStyleHints>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <QWindow>
 
@@ -425,7 +426,14 @@ void MainWindow::InitCoreCallbacks()
 {
   connect(&Settings::Instance(), &Settings::EmulationStateChanged, this, [this](Core::State state) {
     if (state == Core::State::Uninitialized)
+    {
       OnStopComplete();
+      // The System Menu session (if any) has ended: disarm the banner-brick watchdog so a
+      // later game's stray memory fault is never misattributed to the channel grid.
+      WiiUtils::SetWiiMenuBootPending(false);
+      if (m_wii_menu_brick_timer)
+        m_wii_menu_brick_timer->stop();
+    }
 
     if (state == Core::State::Running && m_fullscreen_requested)
     {
@@ -750,6 +758,11 @@ void MainWindow::ConnectHost()
   // menu's PPC is already reset-and-paused (so nothing runs into a crash mid-swap).
   WiiUtils::SetForwarderBootHandler([this](const std::string& disc_path) {
     QueueOnObject(this, [this, disc_path] {
+      // Leaving the menu to boot a game: disarm the banner-brick watchdog (the game itself
+      // may legitimately fault, and that must not be treated as a menu brick).
+      WiiUtils::SetWiiMenuBootPending(false);
+      if (m_wii_menu_brick_timer)
+        m_wii_menu_brick_timer->stop();
       const bool prev_confirm = Config::Get(Config::MAIN_CONFIRM_ON_STOP);
       Config::SetCurrent(Config::MAIN_CONFIRM_ON_STOP, false);
       StartGame(disc_path, ScanForSecondDisc::No);
@@ -1629,7 +1642,38 @@ void MainWindow::PerformOnlineUpdate(const std::string& region)
 
 void MainWindow::BootWiiSystemMenu()
 {
+  // Arm the banner-brick watchdog. While the System Menu is the running session, a null-read
+  // panic is attributed to the channel grid: the panic handler suppresses the dialog spam
+  // and flags it here; we then stop cleanly and rebuild safe banners on the next launch.
+  WiiUtils::SetWiiMenuBootPending(true);
+  if (!m_wii_menu_brick_timer)
+  {
+    m_wii_menu_brick_timer = new QTimer(this);
+    m_wii_menu_brick_timer->setInterval(500);
+    connect(m_wii_menu_brick_timer, &QTimer::timeout, this, [this] {
+      if (WiiUtils::ConsumeWiiMenuBrickDetected())
+        OnWiiMenuBannerBrick();
+    });
+  }
+  m_wii_menu_brick_timer->start();
   StartGame(std::make_unique<BootParameters>(BootParameters::NANDTitle{Titles::SYSTEM_MENU}));
+}
+
+void MainWindow::OnWiiMenuBannerBrick()
+{
+  if (m_wii_menu_brick_timer)
+    m_wii_menu_brick_timer->stop();
+  WiiUtils::SetWiiMenuBootPending(false);
+  // Stop the wedged menu without the "confirm stop" prompt; the heal markers are already
+  // written, so the next launch (or Tools > Sync Wii Menu Channels) rebuilds safe banners.
+  const bool prev_confirm = Config::Get(Config::MAIN_CONFIRM_ON_STOP);
+  Config::SetCurrent(Config::MAIN_CONFIRM_ON_STOP, false);
+  RequestStop();
+  Config::SetCurrent(Config::MAIN_CONFIRM_ON_STOP, prev_confirm);
+  ModalMessageBox::warning(
+      this, tr("Wii Menu"),
+      tr("A channel banner crashed the Wii Menu's channel grid.\n\nVibeDolphin has switched to "
+         "safe banners and will rebuild the channels the next time you open the Wii Menu."));
 }
 
 void MainWindow::RunForwarderSync()
@@ -1644,11 +1688,16 @@ void MainWindow::RunForwarderSync()
     if (!ios.GetESCore().FindInstalledTMD(Titles::SYSTEM_MENU).IsValid())
       return;  // no System Menu -> forwarder tiles can't appear; nothing to sync
   }
-  std::thread([] {
+  // Crash self-heal: if a prior session recorded a banner brick, stay in safe-banner mode,
+  // and (once, via the one-shot regen marker) rebuild every channel with the plain donor.
+  if (WiiUtils::HasSafeBannerMarker())
+    WiiUtils::SetSafeBannerMode(true);
+  const bool force_reinstall = WiiUtils::ConsumeBannerRegenPending();
+  std::thread([force_reinstall] {
     const std::vector<std::string> dirs = Config::GetIsoPaths();
     const std::vector<std::string_view> dir_views(dirs.begin(), dirs.end());
     const std::vector<std::string> paths = UICommon::FindAllGamePaths(dir_views, true);
-    WiiUtils::SyncForwardersWithLibrary(paths);
+    WiiUtils::SyncForwardersWithLibrary(paths, force_reinstall);
   }).detach();
 }
 

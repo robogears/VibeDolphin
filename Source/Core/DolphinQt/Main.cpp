@@ -56,6 +56,14 @@
 static bool QtMsgAlertHandler(const char* caption, const char* text, bool yes_no,
                               Common::MsgType style)
 {
+  // VibeDolphin crash self-heal: if a forwarder channel banner just bricked the Wii Menu's
+  // grid renderer, swallow the (repeating) null-read panic so it doesn't flood the screen.
+  // The marker written here makes the next launch rebuild every channel with a safe banner;
+  // MainWindow also stops emulation and notifies the user. Gated on an active Wii Menu boot
+  // inside WiiUtils, so a normal game's stray fault still shows its dialog as usual.
+  if (style == Common::MsgType::Warning && WiiUtils::NotePanicMessageMaybeBrick(text))
+    return false;
+
   const bool called_from_cpu_thread = Core::IsCPUThread();
   const bool called_from_gpu_thread = Core::IsGPUThread();
 
