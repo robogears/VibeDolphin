@@ -3,7 +3,7 @@
 #
 # Usage:  Distribution/build-appimage.sh [SOURCE_DIR] [VERSION]
 #   SOURCE_DIR  defaults to the repo root (parent of this script)
-#   VERSION     defaults to 0.1.3 (used only for the output filename)
+#   VERSION     defaults to 0.1.4 (used only for the output filename)
 #
 # Run on Linux x86_64 with the Dolphin build dependencies installed, e.g. on Ubuntu:
 #   sudo apt install build-essential cmake ninja-build pkg-config qt6-base-dev \
@@ -15,11 +15,11 @@
 set -euo pipefail
 
 SRC="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
-VERSION="${2:-0.1.3}"
+VERSION="${2:-0.1.4}"
 BUILD="$SRC/build-appimage"
 APPDIR="$SRC/AppDir"
 TOOLS="${APPIMAGE_TOOLS_DIR:-$HOME/.cache/vibedolphin-appimage-tools}"
-OUT="$SRC/VibeDolphin-${VERSION}-x86_64.AppImage"
+OUT="$SRC/VibeDolphin.AppImage"
 
 # --- fetch the AppImage tooling (cached) ---
 mkdir -p "$TOOLS"
@@ -42,6 +42,8 @@ mv "$APPDIR/usr/share/dolphin-emu/sys" "$APPDIR/usr/bin/Sys"
 # --- icon to AppDir root + strip any CRLF from the .desktop (Windows-checkout artifact) ---
 cp -f "$APPDIR/usr/share/icons/hicolor/256x256/apps/dolphin-emu.png" "$APPDIR/dolphin-emu.png"
 sed -i 's/\r$//' "$APPDIR/usr/share/applications/dolphin-emu.desktop"
+# Brand the app name "VibeDolphin" (shown by Steam / desktop launchers and the AppImage name).
+sed -i 's/^Name=.*/Name=VibeDolphin/' "$APPDIR/usr/share/applications/dolphin-emu.desktop"
 
 # --- bundle Qt (linuxdeploy's own appimage-output step is buggy on icons, so we
 #     run appimagetool ourselves below; '|| true' tolerates that step erroring) ---
@@ -59,7 +61,18 @@ export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH}"
 export QT_QPA_PLATFORM_PLUGIN_PATH="${HERE}/usr/plugins/platforms"
 export QT_PLUGIN_PATH="${HERE}/usr/plugins"
 export DOLPHIN_EMU_USERPATH="${DOLPHIN_EMU_USERPATH:-${XDG_DATA_HOME:-$HOME/.local/share}/vibedolphin}"
-exec "${HERE}/usr/bin/dolphin-emu" "$@"
+# VibeDolphin kiosk: with no arguments, boot straight into the Wii System Menu once one is
+# installed, so launching from Steam drops you right into the channel grid. Pass --gui to
+# force the normal Dolphin interface (first-run setup, settings, installing the System Menu);
+# any explicit arguments also bypass kiosk mode. First run (no System Menu yet) -> the GUI.
+EXTRA=()
+if [ "${1:-}" = "--gui" ]; then
+  shift
+elif [ "$#" -eq 0 ] && \
+     [ -f "${DOLPHIN_EMU_USERPATH}/Wii/title/00000001/00000002/content/title.tmd" ]; then
+  EXTRA=(--wii-menu)
+fi
+exec "${HERE}/usr/bin/dolphin-emu" "${EXTRA[@]}" "$@"
 EOF
 chmod +x "$APPDIR/AppRun"
 cp -f "$APPDIR/dolphin-emu.png" "$APPDIR/.DirIcon"

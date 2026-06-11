@@ -30,6 +30,7 @@
 #include "Common/StringUtil.h"
 
 #include "Core/Boot/Boot.h"
+#include "Core/CommonTitles.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
 #include "Core/DolphinAnalytics.h"
@@ -256,6 +257,12 @@ int main(int argc, char* argv[])
         paths, BootSessionData(save_state_path, DeleteSavestateAfterBoot::No));
     game_specified = true;
   }
+  else if (options.is_set("wii_menu"))
+  {
+    // VibeDolphin kiosk: boot straight into the emulated Wii System Menu (the channel grid).
+    boot = std::make_unique<BootParameters>(BootParameters::NANDTitle{Titles::SYSTEM_MENU});
+    game_specified = true;
+  }
   else if (options.is_set("nand_title"))
   {
     const std::string hex_string = static_cast<const char*>(options.get("nand_title"));
@@ -307,7 +314,7 @@ int main(int argc, char* argv[])
     Settings::Instance().ApplyStyle();
 
     MainWindow win{Core::System::GetInstance(), std::move(boot),
-                   static_cast<const char*>(options.get("movie"))};
+                   static_cast<const char*>(options.get("movie")), options.is_set("wii_menu")};
 
 #if defined(USE_ANALYTICS) && USE_ANALYTICS
     if (!Config::Get(Config::MAIN_ANALYTICS_PERMISSION_ASKED))

@@ -86,7 +86,7 @@ class MainWindow final : public QMainWindow
 
 public:
   explicit MainWindow(Core::System& system, std::unique_ptr<BootParameters> boot_parameters,
-                      const std::string& movie_path);
+                      const std::string& movie_path, bool wii_menu_kiosk = false);
   ~MainWindow() override;
 
   WindowSystemInfo GetWindowSystemInfo() const;
@@ -128,6 +128,10 @@ private:
   void BootWiiSystemMenu();
   void ScheduleForwarderAutoSync();
   void RunForwarderSync();
+  // Shared body for the auto-sync, the Tools-menu action, and the kiosk pre-boot sync.
+  // When |synchronous| is true the reconcile runs inline (used before the kiosk boots the
+  // Wii Menu, so its NAND writes can't race the menu's reads); otherwise on a worker thread.
+  void RunForwarderSyncImpl(bool synchronous);
   // Invoked when a forwarder channel banner bricks the Wii Menu's grid renderer: stops the
   // wedged session and tells the user (safe banners are rebuilt on the next launch).
   void OnWiiMenuBannerBrick();
@@ -258,6 +262,9 @@ private:
   bool m_is_screensaver_inhibited = false;
   u32 m_state_slot = 1;
   std::unique_ptr<BootParameters> m_pending_boot;
+  // Kiosk mode (--wii-menu): booted straight into the Wii System Menu, fullscreen, with the
+  // channel sync run synchronously before the boot.
+  bool m_wii_menu_kiosk = false;
   // Polls for a Wii Menu banner brick (flagged on the CPU thread by the panic handler) while
   // the System Menu is the running session; armed in BootWiiSystemMenu, stopped on stop.
   QTimer* m_wii_menu_brick_timer = nullptr;

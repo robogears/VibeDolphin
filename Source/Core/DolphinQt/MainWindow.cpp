@@ -220,9 +220,10 @@ static std::vector<std::string> StringListToStdVector(const QStringList& list)
 }
 
 MainWindow::MainWindow(Core::System& system, std::unique_ptr<BootParameters> boot_parameters,
-                       const std::string& movie_path)
+                       const std::string& movie_path, bool wii_menu_kiosk)
     : QMainWindow(nullptr), m_system(system)
 {
+  m_wii_menu_kiosk = wii_menu_kiosk;
   setWindowTitle(QString::fromStdString(Common::GetScmRevStr()));
   setWindowIcon(Resources::GetAppIcon());
   setUnifiedTitleAndToolBarOnMac(true);
@@ -312,8 +313,20 @@ MainWindow::MainWindow(Core::System& system, std::unique_ptr<BootParameters> boo
   // shouldn't be so we have to reapply all our rules afterwards.
   Settings::Instance().RefreshWidgetVisibility();
 
-  // Keep the emulated Wii Menu's forwarder channels in sync with the game library.
-  ScheduleForwarderAutoSync();
+  // Keep the emulated Wii Menu's forwarder channels in sync with the game library. In kiosk
+  // mode we're about to boot straight into the Wii Menu, so reconcile SYNCHRONOUSLY now while
+  // Core is still uninitialized (the boot below happens after this) — that gives the menu a
+  // fresh set of tiles and avoids the sync's NAND writes racing the menu's NAND reads — and
+  // force fullscreen for the session.
+  if (m_wii_menu_kiosk)
+  {
+    Config::SetCurrent(Config::MAIN_FULLSCREEN, true);
+    RunForwarderSyncImpl(/*synchronous=*/true);
+  }
+  else
+  {
+    ScheduleForwarderAutoSync();
+  }
 
   if (!ResourcePack::Init())
   {
@@ -1678,9 +1691,15 @@ void MainWindow::OnWiiMenuBannerBrick()
 
 void MainWindow::RunForwarderSync()
 {
+  RunForwarderSyncImpl(/*synchronous=*/false);
+}
+
+void MainWindow::RunForwarderSyncImpl(bool synchronous)
+{
   // Reconcile the Wii Menu's forwarder channels with the game library. Gated so it only
   // runs when idle and a System Menu is installed; the heavy work (disc scan + NAND
-  // import/uninstall) runs on a detached worker thread so the UI never blocks.
+  // import/uninstall) normally runs on a detached worker thread so the UI never blocks
+  // (the kiosk pre-boot path passes synchronous=true to finish before the menu boots).
   if (!Core::IsUninitialized(m_system))
     return;
   {
@@ -1693,12 +1712,16 @@ void MainWindow::RunForwarderSync()
   if (WiiUtils::HasSafeBannerMarker())
     WiiUtils::SetSafeBannerMode(true);
   const bool force_reinstall = WiiUtils::ConsumeBannerRegenPending();
-  std::thread([force_reinstall] {
+  auto body = [force_reinstall] {
     const std::vector<std::string> dirs = Config::GetIsoPaths();
     const std::vector<std::string_view> dir_views(dirs.begin(), dirs.end());
     const std::vector<std::string> paths = UICommon::FindAllGamePaths(dir_views, true);
     WiiUtils::SyncForwardersWithLibrary(paths, force_reinstall);
-  }).detach();
+  };
+  if (synchronous)
+    body();
+  else
+    std::thread(std::move(body)).detach();
 }
 
 void MainWindow::ScheduleForwarderAutoSync()

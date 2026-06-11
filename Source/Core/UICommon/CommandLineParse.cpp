@@ -104,6 +104,10 @@ std::unique_ptr<optparse::OptionParser> CreateParser(ParserOptions options)
       .metavar("<file>")
       .type("string")
       .help("Load the initial save state");
+  parser->add_option("--wii-menu")
+      .action("store_true")
+      .dest("wii_menu")
+      .help("Boot straight into the emulated Wii System Menu, fullscreen (VibeDolphin kiosk)");
   parser->add_option("--generate-forwarders")
       .action("store_true")
       .dest("generate_forwarders")
