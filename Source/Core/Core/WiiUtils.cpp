@@ -361,6 +361,125 @@ std::vector<u8> BuildForwarderTMD(u64 title_id, u64 ios_id, u32 content_id, u64 
   std::memcpy(&tmd[0x1E4 + 0x10], content_sha1.data(), content_sha1.size());
   return tmd;
 }
+
+// Rewrite the System Menu's channel grid (iplsave.bin) so forwarder tiles stack evenly:
+// system channels first (in their existing order), then our forwarders in a stable order by
+// game id, packed into consecutive slots with no gaps. The Wii Menu's own reconcile is what
+// leaves a hole when a game is removed and scatters newly-added tiles; pre-packing the file
+// (after the NAND set is already reconciled) fixes both. SAFE: the System Menu validates this
+// file's MD5 on boot and regenerates a default layout if it's wrong, so a bad write can never
+// brick the menu (worst case it falls back to its own ordering).
+//
+// iplsave.bin (decompiled from the retail System Menu, koopthekoopa/wii-ipl): magic "RIPL",
+// 0x4C0 bytes (version 3), all big-endian. chanInfo[48] @0x10 (16-byte SInfo: u8 primaryType,
+// u8 secondaryType, u8 reserved[2], be32 sceneID, be32 titleType, be32 titleCode), titleCache
+// [48] @0x320 (be64 title id each), MD5 @0x4B0 over bytes [0, 0x4B0).
+void RepackWiiMenuChannelLayout(const std::vector<ForwarderMapEntry>& desired)
+{
+  constexpr size_t FILE_SIZE = 0x4C0, CHAN_OFF = 0x10, TCACHE_OFF = 0x320, MD5_OFF = 0x4B0;
+  constexpr size_t SLOTS = 48, INFO = 16;
+  const std::string path =
+      Common::GetTitleDataPath(Titles::SYSTEM_MENU, Common::FromWhichRoot::Configured) +
+      "/iplsave.bin";
+
+  std::vector<u8> d(FILE_SIZE);
+  {
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+      return;  // the menu hasn't created it yet (first run) -> it'll exist next launch
+    in.read(reinterpret_cast<char*>(d.data()), FILE_SIZE);
+    if (in.gcount() != static_cast<std::streamsize>(FILE_SIZE))
+      return;
+  }
+  const auto rd32 = [&](size_t o) {
+    return (u32{d[o]} << 24) | (u32{d[o + 1]} << 16) | (u32{d[o + 2]} << 8) | u32{d[o + 3]};
+  };
+  // Only touch a known version-3 RIPL file (conservative: skip anything unexpected).
+  if (std::memcmp(d.data(), "RIPL", 4) != 0 || rd32(0x04) != FILE_SIZE || rd32(0x08) != 3)
+    return;
+
+  // Installed forwarders: low32 title code -> game id (for validity + stable ordering).
+  std::map<u32, std::string> fwd;
+  for (const ForwarderMapEntry& e : desired)
+    if (IsForwarderTitle(e.title_id))
+      fwd.emplace(static_cast<u32>(e.title_id & 0xFFFFFFFFu), e.game_id);
+
+  // Walk the current grid: keep non-forwarder channels (Disc/Mii/WiiWare/...) in order;
+  // collect installed forwarders (dropping any stale tile whose game is no longer present).
+  std::vector<std::array<u8, INFO>> others;
+  std::vector<u32> forwarders;
+  std::set<u32> seen;
+  for (size_t s = 0; s < SLOTS; ++s)
+  {
+    const size_t o = CHAN_OFF + s * INFO;
+    if (d[o] == 0)  // PRIMARY_TYPE_NONE -> empty slot
+      continue;
+    const u32 ttype = rd32(o + 8), tcode = rd32(o + 12);
+    if (ttype == 0x00010001u && (tcode >> 24) == 0x46)  // our forwarder namespace
+    {
+      if (fwd.count(tcode) && seen.insert(tcode).second)
+        forwarders.push_back(tcode);
+    }
+    else
+    {
+      std::array<u8, INFO> info;
+      std::copy(d.begin() + o, d.begin() + o + INFO, info.begin());
+      others.push_back(info);
+    }
+  }
+  // Add installed forwarders not yet in the grid (newly synced this run).
+  for (const auto& [tcode, game_id] : fwd)
+    if (seen.insert(tcode).second)
+      forwarders.push_back(tcode);
+  // Deterministic order so a given game always lands in the same place.
+  std::sort(forwarders.begin(), forwarders.end(),
+            [&](u32 a, u32 b) { return fwd[a] < fwd[b]; });
+
+  // Repack: clear the grid, then lay out [system channels...][forwarders...], no gaps.
+  std::fill(d.begin() + CHAN_OFF, d.begin() + CHAN_OFF + SLOTS * INFO, u8{0});
+  std::fill(d.begin() + TCACHE_OFF, d.begin() + TCACHE_OFF + SLOTS * 8, u8{0});
+  size_t slot = 0;
+  for (const std::array<u8, INFO>& info : others)
+  {
+    if (slot >= SLOTS)
+      break;
+    const size_t o = CHAN_OFF + slot * INFO;
+    std::copy(info.begin(), info.end(), d.begin() + o);
+    const u32 ttype = (u32{info[8]} << 24) | (u32{info[9]} << 16) | (u32{info[10]} << 8) | info[11];
+    const u32 tcode =
+        (u32{info[12]} << 24) | (u32{info[13]} << 16) | (u32{info[14]} << 8) | info[15];
+    WriteBE64(d, TCACHE_OFF + slot * 8, (u64{ttype} << 32) | tcode);
+    ++slot;
+  }
+  for (const u32 tcode : forwarders)
+  {
+    if (slot >= SLOTS)
+    {
+      WARN_LOG_FMT(IOS_ES, "Wii Menu has only {} channel slots; some forwarder tiles omitted",
+                   SLOTS);
+      break;
+    }
+    const size_t o = CHAN_OFF + slot * INFO;
+    d[o + 0] = 3;  // PRIMARY_TYPE_CHANNEL
+    d[o + 1] = 0;  // SECONARY_TYPE_NORMAL
+    WriteBE32(d, o + 4, 0x0000000Eu);  // sceneID = SCENE_ID_WAD_CHANNEL
+    WriteBE32(d, o + 8, 0x00010001u);  // titleType
+    WriteBE32(d, o + 12, tcode);       // titleCode
+    WriteBE64(d, TCACHE_OFF + slot * 8, (0x00010001ULL << 32) | tcode);
+    ++slot;
+  }
+
+  // Recompute the MD5 over [0, 0x4B0) and write the file back.
+  std::array<u8, 16> digest{};
+  mbedtls_md5_ret(d.data(), MD5_OFF, digest.data());
+  std::copy(digest.begin(), digest.end(), d.begin() + MD5_OFF);
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  if (!out)
+    return;
+  out.write(reinterpret_cast<const char*>(d.data()), FILE_SIZE);
+  INFO_LOG_FMT(IOS_ES, "Wii Menu layout repacked: {} system + {} forwarder tiles, no gaps",
+               others.size(), forwarders.size());
+}
 }  // namespace
 
 void SetForwarderBootHandler(std::function<void(const std::string&)> handler)
@@ -764,6 +883,11 @@ ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& cu
     ReloadForwarderMap();
     result.map_modified = true;
   }
+
+  // Pack the forwarder tiles into the Wii Menu's channel grid so they stack evenly (no gaps
+  // when a game is removed, deterministic order instead of scattered). Runs every sync; the
+  // menu safely falls back to its own layout if the file is ever malformed.
+  RepackWiiMenuChannelLayout(desired);
 
   INFO_LOG_FMT(IOS_ES, "Forwarder sync: installed={} moved={} present={} uninstalled={} (map {})",
                result.installed, result.moved, result.already_present, result.uninstalled,

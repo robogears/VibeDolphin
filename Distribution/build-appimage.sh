@@ -3,7 +3,7 @@
 #
 # Usage:  Distribution/build-appimage.sh [SOURCE_DIR] [VERSION]
 #   SOURCE_DIR  defaults to the repo root (parent of this script)
-#   VERSION     defaults to 0.1.4 (used only for the output filename)
+#   VERSION     defaults to 0.1.5 (used only for the output filename)
 #
 # Run on Linux x86_64 with the Dolphin build dependencies installed, e.g. on Ubuntu:
 #   sudo apt install build-essential cmake ninja-build pkg-config qt6-base-dev \
@@ -15,7 +15,7 @@
 set -euo pipefail
 
 SRC="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
-VERSION="${2:-0.1.4}"
+VERSION="${2:-0.1.5}"
 BUILD="$SRC/build-appimage"
 APPDIR="$SRC/AppDir"
 TOOLS="${APPIMAGE_TOOLS_DIR:-$HOME/.cache/vibedolphin-appimage-tools}"
