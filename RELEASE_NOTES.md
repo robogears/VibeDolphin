@@ -18,7 +18,7 @@ First VibeDolphin release — a Dolphin fork that turns the emulated Wii System 
 
 - **Linux / Steam Deck (x86_64)**: download `VibeDolphin-0.1.1-x86_64.AppImage`, make it executable (`chmod +x VibeDolphin-0.1.1-x86_64.AppImage`), and run it. On the Steam Deck, add it to Steam as a non-Steam game and launch it from Game Mode.
 
-Config and NAND live in the usual Dolphin user directory (`~/.local/share/dolphin-emu`), or alongside the AppImage if you place a `User` folder there (portable mode).
+VibeDolphin keeps its **own** config, NAND, and saves under `~/.local/share/vibedolphin` — completely separate from any stock Dolphin install, so it never touches your existing Dolphin setup. (It starts fresh, so on first run set your game paths and install a Wii System Menu in VibeDolphin.)
 
 ## Requirements
 - A Wii **System Menu** must be installed in Dolphin's NAND (Tools → Perform Online System Update) — the channel tiles render inside it.
