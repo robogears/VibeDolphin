@@ -298,6 +298,9 @@ void HotkeyScheduler::Run()
           Settings::Instance().SetWiiSpeakMuted(muted);
           OSD::AddMessage(muted ? "Wii Speak muted" : "Wii Speak unmuted");
         }
+
+        if (IsHotkey(HK_RETURN_TO_WII_MENU))
+          emit ReturnToWiiMenu();
       }
 
       if (IsHotkey(HK_PREV_WIIMOTE_PROFILE_1))

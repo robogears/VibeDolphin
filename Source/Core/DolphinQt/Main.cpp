@@ -13,6 +13,9 @@
 #include <cstdlib>
 #endif
 
+#include <fstream>
+#include <string_view>
+
 #include <OptionParser.h>
 #include <QAbstractEventDispatcher>
 #include <QApplication>
@@ -21,6 +24,7 @@
 #include <QWidget>
 
 #include "Common/Config/Config.h"
+#include "Common/FileUtil.h"
 #include "Common/MsgHandler.h"
 #include "Common/ScopeGuard.h"
 #include "Common/StringUtil.h"
@@ -30,6 +34,7 @@
 #include "Core/Core.h"
 #include "Core/DolphinAnalytics.h"
 #include "Core/System.h"
+#include "Core/WiiUtils.h"
 
 #include "DolphinQt/Host.h"
 #include "DolphinQt/MainWindow.h"
@@ -45,6 +50,7 @@
 #include "DolphinQt/Updater.h"
 
 #include "UICommon/CommandLineParse.h"
+#include "UICommon/GameFileCache.h"
 #include "UICommon/UICommon.h"
 
 static bool QtMsgAlertHandler(const char* caption, const char* text, bool yes_no,
@@ -192,6 +198,38 @@ int main(int argc, char* argv[])
   // queued in the Core first.
   QObject::connect(QAbstractEventDispatcher::instance(), &QAbstractEventDispatcher::aboutToBlock,
                    &app, [] { Core::HostDispatchJobs(Core::System::GetInstance()); });
+
+  // (DEV) Generate forwarder channels for every Wii game in the configured library
+  // and exit, without launching the GUI.
+  if (options.is_set("generate_forwarders"))
+  {
+    std::vector<std::string> dirs = Config::GetIsoPaths();
+    const std::vector<std::string_view> dir_views(dirs.begin(), dirs.end());
+    const std::vector<std::string> paths = UICommon::FindAllGamePaths(dir_views, true);
+    std::vector<WiiUtils::ForwarderLibraryEntry> games;
+    games.reserve(paths.size());
+    for (const std::string& p : paths)
+      games.push_back({p, std::string{}});
+    const size_t installed = WiiUtils::InstallForwardersForLibrary(games);
+    return installed > 0 ? 0 : 1;
+  }
+
+  // (DEV) Diagnose the forwarder map lookup for the Mario Kart forwarder id, then
+  // exit. Writes details to <user>/fwd_test.txt. 0 = lookup found a path; else 1.
+  if (options.is_set("test_forwarder_lookup"))
+  {
+    const u64 tid = 0x0001000146c3410bULL;
+    const std::string mappath = File::GetUserPath(D_USER_IDX) + "forwarders.json";
+    const bool is_fwd = WiiUtils::IsForwarderTitle(tid);
+    const std::optional<std::string> found = WiiUtils::LookupForwarderDiscPath(tid);
+    std::ofstream(File::GetUserPath(D_USER_IDX) + "fwd_test.txt")
+        << "mappath=" << mappath << "\n"
+        << "file_exists=" << File::Exists(mappath) << "\n"
+        << "is_forwarder=" << is_fwd << "\n"
+        << "lookup_found=" << found.has_value() << "\n"
+        << "lookup_path=" << (found ? *found : std::string("(none)")) << "\n";
+    return found ? 0 : 1;
+  }
 
   std::optional<std::string> save_state_path;
   if (options.is_set("save_state"))

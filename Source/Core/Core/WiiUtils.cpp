@@ -4,11 +4,18 @@
 #include "Core/WiiUtils.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bitset>
 #include <cstddef>
+#include <cstring>
+#include <fstream>
+#include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string_view>
 #include <unordered_set>
@@ -16,17 +23,22 @@
 #include <vector>
 
 #include <fmt/format.h>
+#include <mbedtls/md5.h>
 #include <pugixml.hpp>
 
 #include "Common/Align.h"
 #include "Common/Assert.h"
 #include "Common/CommonTypes.h"
 #include "Common/Contains.h"
+#include "Common/Crypto/AES.h"
+#include "Common/Crypto/SHA1.h"
 #include "Common/FileUtil.h"
 #include "Common/HttpRequest.h"
+#include "Common/JsonUtil.h"
 #include "Common/Logging/Log.h"
 #include "Common/MsgHandler.h"
 #include "Common/NandPaths.h"
+#include "Common/ScopeGuard.h"
 #include "Common/StringUtil.h"
 #include "Common/Swap.h"
 #include "Core/CommonTitles.h"
@@ -45,12 +57,631 @@
 #include "DiscIO/DiscUtils.h"
 #include "DiscIO/Enums.h"
 #include "DiscIO/Filesystem.h"
+#include "DiscIO/Volume.h"
 #include "DiscIO/VolumeDisc.h"
 #include "DiscIO/VolumeFileBlobReader.h"
 #include "DiscIO/VolumeWad.h"
 
 namespace WiiUtils
 {
+namespace
+{
+// Frontend-registered handler that boots a disc image (replacing the current
+// session) when a forwarder channel is launched. Null in non-GUI link targets.
+std::function<void(const std::string&)> s_forwarder_boot_handler;
+
+// In-memory forwarder title-id -> disc-path map, lazily loaded from forwarders.json.
+std::map<u64, std::string> s_forwarder_map;
+std::mutex s_forwarder_map_mutex;
+bool s_forwarder_map_loaded = false;
+
+// Guards SyncForwardersWithLibrary against re-entrancy / concurrent runs.
+std::atomic<bool> s_forwarder_sync_running{false};
+
+// A full forwarders.json row (the lazy lookup map only retains title_id -> disc_path).
+struct ForwarderMapEntry
+{
+  u64 title_id = 0;
+  std::string game_id;
+  u16 revision = 0;
+  std::string disc_path;
+  std::string long_name;
+};
+
+// Parse every field of forwarders.json (unlike the title_id+disc_path-only lazy loader).
+// Returns an empty list for a missing/corrupt file (treated as a fresh install).
+std::vector<ForwarderMapEntry> LoadForwarderMapFull()
+{
+  std::vector<ForwarderMapEntry> entries;
+  const std::string path = File::GetUserPath(D_USER_IDX) + "forwarders.json";
+  picojson::value root;
+  std::string error;
+  if (!JsonFromFile(path, &root, &error) || !root.is<picojson::object>())
+    return entries;
+  const picojson::object& obj = root.get<picojson::object>();
+  const auto forwarders = obj.find("forwarders");
+  if (forwarders == obj.end() || !forwarders->second.is<picojson::array>())
+    return entries;
+  for (const picojson::value& v : forwarders->second.get<picojson::array>())
+  {
+    if (!v.is<picojson::object>())
+      continue;
+    const picojson::object& row = v.get<picojson::object>();
+    const std::optional<std::string> tid = ReadStringFromJson(row, "title_id");
+    const std::optional<std::string> disc = ReadStringFromJson(row, "disc_path");
+    if (!tid || !disc)
+      continue;
+    ForwarderMapEntry e;
+    e.title_id = std::stoull(*tid, nullptr, 16);
+    e.disc_path = *disc;
+    e.game_id = ReadStringFromJson(row, "game_id").value_or("");
+    e.long_name = ReadStringFromJson(row, "long_name").value_or("");
+    const auto rev = row.find("revision");
+    if (rev != row.end() && rev->second.is<double>())
+      e.revision = static_cast<u16>(rev->second.get<double>());
+    entries.push_back(std::move(e));
+  }
+  return entries;
+}
+
+// Serialize the forwarder map (same schema InstallForwardersForLibrary writes).
+bool WriteForwarderMap(const std::vector<ForwarderMapEntry>& entries)
+{
+  picojson::array rows;
+  for (const ForwarderMapEntry& e : entries)
+  {
+    picojson::object row;
+    row["title_id"] = picojson::value(fmt::format("{:016x}", e.title_id));
+    row["game_id"] = picojson::value(e.game_id);
+    row["revision"] = picojson::value(static_cast<double>(e.revision));
+    row["disc_path"] = picojson::value(e.disc_path);
+    row["long_name"] = picojson::value(e.long_name);
+    rows.emplace_back(std::move(row));
+  }
+  picojson::object doc;
+  doc["version"] = picojson::value(1.0);
+  doc["forwarders"] = picojson::value(rows);
+  return JsonToFile(File::GetUserPath(D_USER_IDX) + "forwarders.json", picojson::value(doc), true);
+}
+
+// Retail Wii common key (identical to the one in IOSC). Used to AES-128-CBC
+// encrypt the forwarder's title key so ES can decrypt it during import.
+constexpr std::array<u8, 16> RETAIL_COMMON_KEY = {0xeb, 0xe4, 0x2a, 0x22, 0x5e, 0x85, 0x93, 0xe4,
+                                                  0x48, 0xd9, 0xc5, 0x45, 0x73, 0x81, 0xaa, 0xf7};
+
+void WriteBE16(std::vector<u8>& b, size_t off, u16 v)
+{
+  b[off] = static_cast<u8>(v >> 8);
+  b[off + 1] = static_cast<u8>(v);
+}
+void WriteBE32(std::vector<u8>& b, size_t off, u32 v)
+{
+  for (size_t i = 0; i < 4; ++i)
+    b[off + i] = static_cast<u8>(v >> (24 - 8 * i));
+}
+void WriteBE64(std::vector<u8>& b, size_t off, u64 v)
+{
+  for (size_t i = 0; i < 8; ++i)
+    b[off + i] = static_cast<u8>(v >> (56 - 8 * i));
+}
+
+// Encrypt the (plaintext) title key with the common key. IV = title_id big-endian
+// in the high 8 bytes (the inverse of ESCore::InitTitleImportKey).
+std::array<u8, 16> EncryptTitleKey(const std::array<u8, 16>& plain, u64 title_id)
+{
+  std::array<u8, 16> iv{};
+  for (size_t i = 0; i < 8; ++i)
+    iv[i] = static_cast<u8>(title_id >> (56 - 8 * i));
+  const auto ctx = Common::AES::CreateContextEncrypt(RETAIL_COMMON_KEY.data());
+  std::array<u8, 16> out{};
+  ctx->Crypt(iv.data(), plain.data(), out.data(), out.size());
+  return out;
+}
+
+// AES-128-CBC encrypt content with the (plaintext) title key. IV derives from the
+// content index. Input is zero-padded to a 16-byte multiple; ES decrypts the whole
+// buffer but only hashes/writes the unpadded `size` bytes.
+std::vector<u8> EncryptContent(const std::vector<u8>& plain, u16 index,
+                               const std::array<u8, 16>& title_key)
+{
+  const size_t padded = Common::AlignUp(plain.size(), size_t{16});
+  std::vector<u8> in(padded, 0);
+  std::copy(plain.begin(), plain.end(), in.begin());
+  std::array<u8, 16> iv{};
+  iv[0] = static_cast<u8>(index >> 8);
+  iv[1] = static_cast<u8>(index & 0xFF);
+  const auto ctx = Common::AES::CreateContextEncrypt(title_key.data());
+  std::vector<u8> out(padded, 0);
+  ctx->Crypt(iv.data(), in.data(), out.data(), padded);
+  return out;
+}
+
+// IMET banner layout (offsets within an opening.bnr / channel banner):
+//   0x040  "IMET" magic
+//   0x05C  title block: 10 languages x 42 UTF-16BE chars = 0x348 bytes
+//   0x5F0  IMET MD5 (16 bytes), computed over [0, 0x600) with this field zeroed
+//   0x600  U8 archive (icon.bin / banner.bin / sound.bin) -- the asset payload
+constexpr size_t IMET_HEADER_SIZE = 0x600;
+constexpr size_t IMET_TITLES_OFFSET = 0x5C;
+constexpr size_t IMET_TITLES_SIZE = 0x348;  // 10 langs * 42 * sizeof(char16_t)
+constexpr size_t IMET_MD5_OFFSET = 0x5F0;
+
+// A known-good "donor" channel banner (captured from a menu-safe game). We reuse
+// its asset payload (icon/banner/sound) verbatim and only patch in per-game title
+// text, so a quirky disc banner can never crash the System Menu's grid renderer.
+// Loaded once from the user dir; null if missing/invalid.
+const std::vector<u8>* GetDonorBanner()
+{
+  static const std::optional<std::vector<u8>> s_donor = []() -> std::optional<std::vector<u8>> {
+    const std::string path = File::GetUserPath(D_USER_IDX) + "forwarder_donor.bnr";
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file)
+    {
+      ERROR_LOG_FMT(IOS_ES, "Forwarder: donor banner not found at {}", path);
+      return std::nullopt;
+    }
+    const std::streamoff size = file.tellg();
+    file.seekg(0);
+    std::vector<u8> data(static_cast<size_t>(size > 0 ? size : 0));
+    if (size < static_cast<std::streamoff>(IMET_HEADER_SIZE + 4) ||
+        !file.read(reinterpret_cast<char*>(data.data()), size) || data[0x40] != 'I' ||
+        data[0x41] != 'M' || data[0x42] != 'E' || data[0x43] != 'T')
+    {
+      ERROR_LOG_FMT(IOS_ES, "Forwarder: donor banner at {} is missing/invalid", path);
+      return std::nullopt;
+    }
+    return data;
+  }();
+  return s_donor ? &*s_donor : nullptr;
+}
+
+// Games whose disc opening.bnr crashes the System Menu's channel-grid renderer when
+// reused as a channel banner; we fall back to the safe donor tile for these. Seeded
+// with known-bad ids, and extended via the optional file <user>/forwarder_blocklist.txt
+// (one game id per line, '#' for comments) so users can flag a bad game without a rebuild.
+bool IsBannerBlocklisted(const std::string& game_id)
+{
+  static const std::set<std::string> s_blocklist = [] {
+    std::set<std::string> set{"SSQE01"};  // Mario Party 9 (USA, Asia)
+    std::ifstream file(File::GetUserPath(D_USER_IDX) + "forwarder_blocklist.txt");
+    for (std::string line; std::getline(file, line);)
+    {
+      while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
+        line.pop_back();
+      if (!line.empty() && line.front() != '#')
+        set.insert(line);
+    }
+    return set;
+  }();
+  return s_blocklist.count(game_id) != 0;
+}
+
+// Read the disc's own opening.bnr verbatim (full per-game art: real icon + animation).
+// nullopt if there's no readable, structurally-valid IMET banner.
+std::optional<std::vector<u8>> ReadFullBanner(const DiscIO::Volume& volume,
+                                              const DiscIO::Partition& partition)
+{
+  const DiscIO::FileSystem* const fs = volume.GetFileSystem(partition);
+  if (!fs)
+    return std::nullopt;
+  const std::unique_ptr<DiscIO::FileInfo> info = fs->FindFileInfo("opening.bnr");
+  if (!info)
+    return std::nullopt;
+  std::vector<u8> banner(info->GetSize());
+  if (DiscIO::ReadFile(volume, partition, info.get(), banner.data(), banner.size()) !=
+      banner.size())
+    return std::nullopt;
+  if (banner.size() < IMET_HEADER_SIZE + 4 || banner[0x40] != 'I' || banner[0x41] != 'M' ||
+      banner[0x42] != 'E' || banner[0x43] != 'T')
+    return std::nullopt;
+  return banner;
+}
+
+// Build a guaranteed-System-Menu-safe channel banner for a disc: start from the
+// known-good donor, patch in this game's IMET titles (inert UTF-16BE text), recompute
+// the IMET MD5. Returns nullopt (skip the game) if the donor is missing or the disc
+// has no usable opening.bnr title block.
+std::optional<std::vector<u8>> BuildSafeBanner(const DiscIO::Volume& volume,
+                                               const DiscIO::Partition& partition)
+{
+  const std::vector<u8>* const donor = GetDonorBanner();
+  if (!donor)
+    return std::nullopt;
+  std::vector<u8> banner = *donor;
+
+  // Copy this game's title block (all language slots) from its own opening.bnr.
+  std::array<u8, IMET_TITLES_SIZE> titles{};
+  if (DiscIO::ReadFile(volume, partition, "opening.bnr", titles.data(), titles.size(),
+                       IMET_TITLES_OFFSET) != titles.size())
+    return std::nullopt;
+  std::copy(titles.begin(), titles.end(), banner.begin() + IMET_TITLES_OFFSET);
+
+  // Recompute the IMET MD5 over [0, 0x600) with the 16-byte MD5 field zeroed.
+  std::fill_n(banner.begin() + IMET_MD5_OFFSET, 16, u8{0});
+  std::array<u8, 16> digest{};
+  mbedtls_md5_ret(banner.data(), IMET_HEADER_SIZE, digest.data());
+  std::copy(digest.begin(), digest.end(), banner.begin() + IMET_MD5_OFFSET);
+
+  // Backstop: confirm the IMET + U8 magics are intact before trusting it.
+  if (banner[0x40] != 'I' || banner[0x41] != 'M' || banner[0x42] != 'E' || banner[0x43] != 'T' ||
+      banner[0x600] != 0x55 || banner[0x601] != 0xAA || banner[0x602] != 0x38 ||
+      banner[0x603] != 0x2D)
+    return std::nullopt;
+
+  return banner;
+}
+
+std::vector<u8> BuildForwarderTicket(u64 title_id, const std::array<u8, 16>& enc_title_key)
+{
+  std::vector<u8> t(0x2A4, 0);
+  WriteBE32(t, 0x000, 0x00010001);  // signature type: RSA-2048
+  static constexpr char ISSUER[] = "Root-CA00000001-XS00000003";
+  std::memcpy(&t[0x140], ISSUER, sizeof(ISSUER) - 1);  // null terminator already zero
+  // version (0x1BC) = 0 -> V0 ticket
+  std::memcpy(&t[0x1BF], enc_title_key.data(), enc_title_key.size());
+  WriteBE64(t, 0x1D0, 1);  // ticket_id (nonzero)
+  // device_id (0x1D8) = 0
+  WriteBE64(t, 0x1DC, title_id);
+  // common_key_index (0x1F1) = 0 (retail)
+  return t;
+}
+
+std::vector<u8> BuildForwarderTMD(u64 title_id, u64 ios_id, u32 content_id, u64 content_size,
+                                  const Common::SHA1::Digest& content_sha1)
+{
+  std::vector<u8> tmd(0x1E4 + 0x24, 0);  // header + one content
+  WriteBE32(tmd, 0x000, 0x00010001);     // signature type: RSA-2048
+  static constexpr char ISSUER[] = "Root-CA00000001-CP00000004";
+  std::memcpy(&tmd[0x140], ISSUER, sizeof(ISSUER) - 1);
+  WriteBE64(tmd, 0x184, ios_id);
+  WriteBE64(tmd, 0x18C, title_id);
+  WriteBE32(tmd, 0x194, 0x00000001);  // title_flags: TITLE_TYPE_DEFAULT
+  WriteBE16(tmd, 0x1DC, 1);           // title_version
+  WriteBE16(tmd, 0x1DE, 1);           // num_contents
+  WriteBE16(tmd, 0x1E0, 0);           // boot_index
+  // content record @ 0x1E4 (0x24 bytes)
+  WriteBE32(tmd, 0x1E4 + 0x00, content_id);
+  WriteBE16(tmd, 0x1E4 + 0x04, 0);       // index
+  WriteBE16(tmd, 0x1E4 + 0x06, 0x0001);  // type: normal (not shared/optional)
+  WriteBE64(tmd, 0x1E4 + 0x08, content_size);
+  std::memcpy(&tmd[0x1E4 + 0x10], content_sha1.data(), content_sha1.size());
+  return tmd;
+}
+}  // namespace
+
+void SetForwarderBootHandler(std::function<void(const std::string&)> handler)
+{
+  s_forwarder_boot_handler = std::move(handler);
+}
+
+void RequestForwarderBoot(const std::string& disc_path)
+{
+  if (s_forwarder_boot_handler)
+    s_forwarder_boot_handler(disc_path);
+  else
+    ERROR_LOG_FMT(IOS_ES, "RequestForwarderBoot: no handler registered (disc: {})", disc_path);
+}
+
+u64 ComputeForwarderTitleId(const std::string& game_id, u16 revision)
+{
+  // Deterministic, file-location-independent id from the disc's stable identity.
+  // Channel namespace (0x00010001) with reserved low byte 'F' (0x46) so it never
+  // collides with real Nintendo channels (whose low32 starts with 'H' / 0x48).
+  const std::string key = game_id + "/" + std::to_string(revision);
+  const Common::SHA1::Digest d =
+      Common::SHA1::CalculateDigest(reinterpret_cast<const u8*>(key.data()), key.size());
+  const u32 hash24 = (u32{d[0]} << 16) | (u32{d[1]} << 8) | u32{d[2]};
+  const u32 low32 = 0x46000000u | hash24;
+  return (0x00010001ULL << 32) | low32;
+}
+
+bool IsForwarderTitle(u64 title_id)
+{
+  return (title_id >> 32) == 0x00010001ULL && ((title_id >> 24) & 0xFF) == 0x46;
+}
+
+std::optional<std::string> LookupForwarderDiscPath(u64 title_id)
+{
+  std::lock_guard<std::mutex> lock(s_forwarder_map_mutex);
+  if (!s_forwarder_map_loaded)
+  {
+    // Mark loaded even on failure so we don't re-hit the disk on every launch.
+    s_forwarder_map_loaded = true;
+    const std::string path = File::GetUserPath(D_USER_IDX) + "forwarders.json";
+    picojson::value root;
+    std::string error;
+    if (JsonFromFile(path, &root, &error) && root.is<picojson::object>())
+    {
+      const picojson::object& obj = root.get<picojson::object>();
+      const auto forwarders = obj.find("forwarders");
+      if (forwarders != obj.end() && forwarders->second.is<picojson::array>())
+      {
+        for (const picojson::value& entry : forwarders->second.get<picojson::array>())
+        {
+          if (!entry.is<picojson::object>())
+            continue;
+          const picojson::object& row = entry.get<picojson::object>();
+          const std::optional<std::string> tid = ReadStringFromJson(row, "title_id");
+          const std::optional<std::string> disc = ReadStringFromJson(row, "disc_path");
+          if (tid && disc)
+            s_forwarder_map.emplace(std::stoull(*tid, nullptr, 16), *disc);
+        }
+      }
+    }
+    else if (!error.empty())
+    {
+      WARN_LOG_FMT(IOS_ES, "Forwarder map: failed to parse {}: {}", path, error);
+    }
+  }
+  const auto it = s_forwarder_map.find(title_id);
+  if (it == s_forwarder_map.end())
+    return std::nullopt;
+  return it->second;
+}
+
+void ReloadForwarderMap()
+{
+  std::lock_guard<std::mutex> lock(s_forwarder_map_mutex);
+  s_forwarder_map.clear();
+  s_forwarder_map_loaded = false;
+}
+
+std::optional<ForwarderInfo> InstallForwarder(const std::string& disc_path)
+{
+  const std::unique_ptr<DiscIO::Volume> volume = DiscIO::CreateVolume(disc_path);
+  if (!volume || volume->GetVolumeType() != DiscIO::Platform::WiiDisc)
+  {
+    WARN_LOG_FMT(IOS_ES, "Forwarder: '{}' is not a Wii disc; skipping", disc_path);
+    return std::nullopt;
+  }
+  const DiscIO::Partition partition = volume->GetGamePartition();
+  const std::string game_id = volume->GetGameID(partition);
+  const u16 revision = volume->GetRevision(partition).value_or(0);
+  if (game_id.empty())
+  {
+    WARN_LOG_FMT(IOS_ES, "Forwarder: '{}' has no game id; skipping", disc_path);
+    return std::nullopt;
+  }
+
+  // Prefer the game's own banner (real per-game icon + animation); fall back to the safe
+  // donor tile for banners known to crash the menu, or ones we can't read.
+  std::optional<std::vector<u8>> banner;
+  if (IsBannerBlocklisted(game_id))
+  {
+    banner = BuildSafeBanner(*volume, partition);
+  }
+  else
+  {
+    banner = ReadFullBanner(*volume, partition);
+    if (!banner)
+      banner = BuildSafeBanner(*volume, partition);
+  }
+  if (!banner)
+  {
+    WARN_LOG_FMT(IOS_ES, "Forwarder: '{}' ({}) - no usable banner; skipping", disc_path, game_id);
+    return std::nullopt;
+  }
+
+  const u64 title_id = ComputeForwarderTitleId(game_id, revision);
+  const u64 ios_id = 0x0000000100000000ULL | 0x3D;  // never booted (launch is intercepted)
+  const u32 content_id = 0;
+  const std::array<u8, 16> title_key_plain{};
+  const std::vector<u8>& content_plain = *banner;
+
+  const Common::SHA1::Digest content_sha1 =
+      Common::SHA1::CalculateDigest(content_plain.data(), content_plain.size());
+  const std::vector<u8> enc_content = EncryptContent(content_plain, 0, title_key_plain);
+  const std::array<u8, 16> enc_title_key = EncryptTitleKey(title_key_plain, title_id);
+  const std::vector<u8> ticket_bytes = BuildForwarderTicket(title_id, enc_title_key);
+  const std::vector<u8> tmd_bytes =
+      BuildForwarderTMD(title_id, ios_id, content_id, content_plain.size(), content_sha1);
+
+  // Self-check: round-trip our hand-built blobs through Dolphin's own readers.
+  {
+    const IOS::ES::TicketReader ticket{std::vector<u8>(ticket_bytes)};
+    const IOS::ES::TMDReader tmd{std::vector<u8>(tmd_bytes)};
+    if (!ticket.IsValid() || !tmd.IsValid() || ticket.GetTitleId() != title_id ||
+        tmd.GetTitleId() != title_id)
+    {
+      ERROR_LOG_FMT(IOS_ES, "Forwarder self-check failed for {} ({:016x})", game_id, title_id);
+      return std::nullopt;
+    }
+  }
+
+  // Install into the configured NAND via the ES import API (fake-signed).
+  IOS::HLE::Kernel ios;
+  auto& es = ios.GetESCore();
+  IOS::HLE::ESCore::Context context;
+  const std::vector<u8> no_certs;
+  if (es.ImportTicket(ticket_bytes, no_certs, IOS::HLE::ESCore::TicketImportType::Unpersonalised,
+                      IOS::HLE::ESCore::VerifySignature::No) < 0 ||
+      es.ImportTitleInit(context, tmd_bytes, no_certs, IOS::HLE::ESCore::VerifySignature::No) < 0)
+  {
+    ERROR_LOG_FMT(IOS_ES, "Forwarder {} ({:016x}): ticket/title init failed", game_id, title_id);
+    return std::nullopt;
+  }
+  if (es.ImportContentBegin(context, title_id, content_id) < 0 ||
+      es.ImportContentData(context, 0, enc_content.data(), static_cast<u32>(enc_content.size())) <
+          0 ||
+      es.ImportContentEnd(context, 0) < 0)
+  {
+    es.ImportTitleCancel(context);
+    ERROR_LOG_FMT(IOS_ES, "Forwarder {} ({:016x}): content import failed", game_id, title_id);
+    return std::nullopt;
+  }
+  if (es.ImportTitleDone(context) < 0)
+  {
+    es.ImportTitleCancel(context);
+    return std::nullopt;
+  }
+
+  INFO_LOG_FMT(IOS_ES, "Forwarder installed: {} rev{} -> {:016x}", game_id, revision, title_id);
+  return ForwarderInfo{title_id, game_id, revision};
+}
+
+size_t InstallForwardersForLibrary(const std::vector<ForwarderLibraryEntry>& games)
+{
+  picojson::array rows;
+  for (const ForwarderLibraryEntry& game : games)
+  {
+    const std::optional<ForwarderInfo> info = InstallForwarder(game.disc_path);
+    if (!info)
+      continue;
+    picojson::object row;
+    row["title_id"] = picojson::value(fmt::format("{:016x}", info->title_id));
+    row["game_id"] = picojson::value(info->game_id);
+    row["revision"] = picojson::value(static_cast<double>(info->revision));
+    row["disc_path"] = picojson::value(game.disc_path);
+    row["long_name"] = picojson::value(game.long_name);
+    rows.emplace_back(std::move(row));
+  }
+
+  picojson::object doc;
+  doc["version"] = picojson::value(1.0);
+  doc["forwarders"] = picojson::value(rows);
+  const std::string path = File::GetUserPath(D_USER_IDX) + "forwarders.json";
+  if (!JsonToFile(path, picojson::value(doc), true))
+    ERROR_LOG_FMT(IOS_ES, "Forwarder: failed to write map {}", path);
+
+  ReloadForwarderMap();
+  INFO_LOG_FMT(IOS_ES, "Forwarder sync: installed {} of {} games", rows.size(), games.size());
+  return rows.size();
+}
+
+bool UninstallForwarder(u64 title_id)
+{
+  // Never touch anything outside our forwarder namespace.
+  if (!IsForwarderTitle(title_id))
+    return false;
+  IOS::HLE::Kernel ios;
+  const auto ret = ios.GetESCore().DeleteTitle(title_id);
+  // Best-effort: drop the ticket too so the System Menu tile fully disappears.
+  File::Delete(Common::GetTicketFileName(title_id));
+  if (ret < 0)
+  {
+    WARN_LOG_FMT(IOS_ES, "Forwarder uninstall {:016x}: DeleteTitle failed ({})", title_id,
+                 static_cast<int>(ret));
+    return false;
+  }
+  INFO_LOG_FMT(IOS_ES, "Forwarder uninstalled: {:016x}", title_id);
+  return true;
+}
+
+ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& current_disc_paths)
+{
+  ForwarderSyncResult result;
+  if (s_forwarder_sync_running.exchange(true))
+  {
+    WARN_LOG_FMT(IOS_ES, "Forwarder sync already in progress; skipping");
+    return result;
+  }
+  const Common::ScopeGuard running_guard{[] { s_forwarder_sync_running.store(false); }};
+
+  // Phase 1: the existing map is the authoritative "installed" set.
+  const std::vector<ForwarderMapEntry> old_entries = LoadForwarderMapFull();
+  std::map<std::string, ForwarderMapEntry> old_by_path;
+  std::map<u64, ForwarderMapEntry> old_by_tid;
+  for (const ForwarderMapEntry& e : old_entries)
+  {
+    old_by_path.emplace(e.disc_path, e);
+    old_by_tid.emplace(e.title_id, e);
+  }
+
+  // Phases 2-3: classify each current library path into the desired set.
+  std::vector<ForwarderMapEntry> desired;
+  std::unordered_set<u64> desired_tids;
+  for (const std::string& path : current_disc_paths)
+  {
+    // Already installed at this exact path -> keep as-is (no disc open, no import).
+    const auto present = old_by_path.find(path);
+    if (present != old_by_path.end())
+    {
+      if (desired_tids.insert(present->second.title_id).second)
+      {
+        desired.push_back(present->second);
+        ++result.already_present;
+      }
+      continue;
+    }
+    // New path: identify the disc to compute its deterministic forwarder id.
+    const std::unique_ptr<DiscIO::Volume> volume = DiscIO::CreateVolume(path);
+    if (!volume || volume->GetVolumeType() != DiscIO::Platform::WiiDisc)
+      continue;  // not a Wii disc -> ignore (do NOT treat as a removal)
+    const DiscIO::Partition partition = volume->GetGamePartition();
+    const std::string game_id = volume->GetGameID(partition);
+    if (game_id.empty())
+      continue;
+    const u16 revision = volume->GetRevision(partition).value_or(0);
+    const u64 tid = ComputeForwarderTitleId(game_id, revision);
+    if (desired_tids.count(tid))
+      continue;  // duplicate dump of a game already handled this run
+
+    const auto moved = old_by_tid.find(tid);
+    if (moved != old_by_tid.end())
+    {
+      // Moved/renamed file, same game identity -> already installed, just repoint.
+      ForwarderMapEntry e = moved->second;
+      e.disc_path = path;
+      desired.push_back(e);
+      desired_tids.insert(tid);
+      ++result.moved;
+      continue;
+    }
+    // Not in the map. If the title already exists in NAND (e.g. the map was lost and is
+    // being rebuilt), just re-record it; otherwise build + import it (the expensive path).
+    if (File::Exists(Common::GetTMDFileName(tid)))
+    {
+      desired.push_back({tid, game_id, revision, path, std::string{}});
+      desired_tids.insert(tid);
+      ++result.already_present;
+      continue;
+    }
+    const std::optional<ForwarderInfo> info = InstallForwarder(path);
+    if (!info)
+      continue;
+    desired.push_back({info->title_id, info->game_id, info->revision, path, std::string{}});
+    desired_tids.insert(info->title_id);
+    ++result.installed;
+  }
+
+  // Phase 4: remove NAND forwarder titles no longer wanted (removed games + orphans).
+  // desired_tids is fully computed first, so a moved game (its id stays desired) is never deleted.
+  std::vector<u64> installed_titles;
+  {
+    IOS::HLE::Kernel ios;
+    installed_titles = ios.GetESCore().GetInstalledTitles();
+  }
+  for (const u64 tid : installed_titles)
+  {
+    if (!IsForwarderTitle(tid) || desired_tids.count(tid))
+      continue;
+    if (UninstallForwarder(tid))
+      ++result.uninstalled;
+    else
+      ++result.orphaned;
+  }
+
+  // Phase 5: persist only if the (title_id, disc_path) set actually changed.
+  const auto key = [](const ForwarderMapEntry& e) {
+    return fmt::format("{:016x}|{}", e.title_id, e.disc_path);
+  };
+  std::set<std::string> old_keys, new_keys;
+  for (const ForwarderMapEntry& e : old_entries)
+    old_keys.insert(key(e));
+  for (const ForwarderMapEntry& e : desired)
+    new_keys.insert(key(e));
+  if (old_keys != new_keys && WriteForwarderMap(desired))
+  {
+    ReloadForwarderMap();
+    result.map_modified = true;
+  }
+
+  INFO_LOG_FMT(IOS_ES, "Forwarder sync: installed={} moved={} present={} uninstalled={} (map {})",
+               result.installed, result.moved, result.already_present, result.uninstalled,
+               result.map_modified ? "updated" : "unchanged");
+  return result;
+}
+
 static bool ImportWAD(IOS::HLE::Kernel& ios, const DiscIO::VolumeWAD& wad,
                       IOS::HLE::ESCore::VerifySignature verify_signature)
 {

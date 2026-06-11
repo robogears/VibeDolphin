@@ -328,6 +328,8 @@ void MenuBar::AddToolsMenu()
 
   // Label will be set by a NANDRefresh later
   m_boot_sysmenu = tools_menu->addAction(QString{}, this, [this] { emit BootWiiSystemMenu(); });
+  tools_menu->addAction(tr("Sync Wii Menu Channels"), this,
+                        [this] { emit SyncWiiMenuChannels(); });
   m_wad_install_action = tools_menu->addAction(tr("Install WAD..."), this, &MenuBar::InstallWAD);
   m_manage_nand_menu = tools_menu->addMenu(tr("Manage NAND"));
   m_import_backup = m_manage_nand_menu->addAction(tr("Import BootMii NAND Backup..."), this,

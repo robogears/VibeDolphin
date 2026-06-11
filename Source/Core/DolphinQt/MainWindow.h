@@ -125,6 +125,8 @@ private:
   void IncrementSelectedStateSlot();
   void DecrementSelectedStateSlot();
   void BootWiiSystemMenu();
+  void ScheduleForwarderAutoSync();
+  void RunForwarderSync();
 
   void PerformOnlineUpdate(const std::string& region);
 

@@ -21,7 +21,9 @@
 #include <fmt/format.h>
 
 #include <future>
+#include <mutex>
 #include <optional>
+#include <thread>
 #include <utility>
 #include <variant>
 
@@ -60,6 +62,8 @@
 #include "Core/HW/SI/SI_Device.h"
 #include "Core/HW/Wiimote.h"
 #include "Core/HotkeyManager.h"
+#include "Core/IOS/ES/ES.h"
+#include "Core/IOS/IOS.h"
 #include "Core/IOS/USB/Bluetooth/BTEmu.h"
 #include "Core/Movie.h"
 #include "Core/NetPlayClient.h"
@@ -128,6 +132,7 @@
 
 #include "UICommon/DiscordPresence.h"
 #include "UICommon/GameFile.h"
+#include "UICommon/GameFileCache.h"
 #include "UICommon/ResourcePack/Manager.h"
 #include "UICommon/ResourcePack/ResourcePack.h"
 
@@ -305,6 +310,9 @@ MainWindow::MainWindow(Core::System& system, std::unique_ptr<BootParameters> boo
   // Restoring of window states can sometimes go wrong, resulting in widgets being visible when they
   // shouldn't be so we have to reapply all our rules afterwards.
   Settings::Instance().RefreshWidgetVisibility();
+
+  // Keep the emulated Wii Menu's forwarder channels in sync with the game library.
+  ScheduleForwarderAutoSync();
 
   if (!ResourcePack::Init())
   {
@@ -564,6 +572,7 @@ void MainWindow::ConnectMenuBar()
   connect(m_menu_bar, &MenuBar::ImportNANDBackup, this, &MainWindow::OnImportNANDBackup);
   connect(m_menu_bar, &MenuBar::PerformOnlineUpdate, this, &MainWindow::PerformOnlineUpdate);
   connect(m_menu_bar, &MenuBar::BootWiiSystemMenu, this, &MainWindow::BootWiiSystemMenu);
+  connect(m_menu_bar, &MenuBar::SyncWiiMenuChannels, this, &MainWindow::RunForwarderSync);
   connect(m_menu_bar, &MenuBar::StartNetPlay, this, &MainWindow::ShowNetPlaySetupDialog);
   connect(m_menu_bar, &MenuBar::BrowseNetPlay, this, &MainWindow::ShowNetPlayBrowser);
   connect(m_menu_bar, &MenuBar::ShowFIFOPlayer, this, &MainWindow::ShowFIFOPlayer);
@@ -611,6 +620,8 @@ void MainWindow::ConnectHotkeys()
   connect(m_hotkey_scheduler, &HotkeyScheduler::Open, this, &MainWindow::Open);
   connect(m_hotkey_scheduler, &HotkeyScheduler::ChangeDisc, this, &MainWindow::ChangeDisc);
   connect(m_hotkey_scheduler, &HotkeyScheduler::EjectDisc, this, &MainWindow::EjectDisc);
+  connect(m_hotkey_scheduler, &HotkeyScheduler::ReturnToWiiMenu, this,
+          &MainWindow::BootWiiSystemMenu);
   connect(m_hotkey_scheduler, &HotkeyScheduler::ExitHotkey, this, &MainWindow::close);
   connect(m_hotkey_scheduler, &HotkeyScheduler::UnlockCursor, this, &MainWindow::UnlockCursor);
   connect(m_hotkey_scheduler, &HotkeyScheduler::TogglePauseHotkey, this, &MainWindow::TogglePause);
@@ -731,6 +742,20 @@ void MainWindow::ConnectRenderWidget()
 void MainWindow::ConnectHost()
 {
   connect(Host::GetInstance(), &Host::RequestStop, this, &MainWindow::RequestStop);
+
+  // When a forwarder channel is launched in the emulated System Menu, ES asks the
+  // host to boot the mapped disc. Stop the current (menu) session and boot the disc,
+  // suppressing the "Confirm on Stop" prompt so the swap is seamless. This is safe
+  // now that the ES hook intercepts on the second LaunchPPCTitle pass, where the
+  // menu's PPC is already reset-and-paused (so nothing runs into a crash mid-swap).
+  WiiUtils::SetForwarderBootHandler([this](const std::string& disc_path) {
+    QueueOnObject(this, [this, disc_path] {
+      const bool prev_confirm = Config::Get(Config::MAIN_CONFIRM_ON_STOP);
+      Config::SetCurrent(Config::MAIN_CONFIRM_ON_STOP, false);
+      StartGame(disc_path, ScanForSecondDisc::No);
+      Config::SetCurrent(Config::MAIN_CONFIRM_ON_STOP, prev_confirm);
+    });
+  });
 }
 
 void MainWindow::ConnectStack()
@@ -1605,6 +1630,33 @@ void MainWindow::PerformOnlineUpdate(const std::string& region)
 void MainWindow::BootWiiSystemMenu()
 {
   StartGame(std::make_unique<BootParameters>(BootParameters::NANDTitle{Titles::SYSTEM_MENU}));
+}
+
+void MainWindow::RunForwarderSync()
+{
+  // Reconcile the Wii Menu's forwarder channels with the game library. Gated so it only
+  // runs when idle and a System Menu is installed; the heavy work (disc scan + NAND
+  // import/uninstall) runs on a detached worker thread so the UI never blocks.
+  if (!Core::IsUninitialized(m_system))
+    return;
+  {
+    IOS::HLE::Kernel ios;
+    if (!ios.GetESCore().FindInstalledTMD(Titles::SYSTEM_MENU).IsValid())
+      return;  // no System Menu -> forwarder tiles can't appear; nothing to sync
+  }
+  std::thread([] {
+    const std::vector<std::string> dirs = Config::GetIsoPaths();
+    const std::vector<std::string_view> dir_views(dirs.begin(), dirs.end());
+    const std::vector<std::string> paths = UICommon::FindAllGamePaths(dir_views, true);
+    WiiUtils::SyncForwardersWithLibrary(paths);
+  }).detach();
+}
+
+void MainWindow::ScheduleForwarderAutoSync()
+{
+  // Run the reconcile once per launch, after the main window is up.
+  static std::once_flag s_once;
+  std::call_once(s_once, [this] { RunForwarderSync(); });
 }
 
 void MainWindow::NetPlayInit()

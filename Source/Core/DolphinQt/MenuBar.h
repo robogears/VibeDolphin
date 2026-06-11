@@ -86,6 +86,7 @@ signals:
   void StateSaveOldest();
   void SetStateSlot(int slot);
   void BootWiiSystemMenu();
+  void SyncWiiMenuChannels();
   void ImportNANDBackup();
 
   void PerformOnlineUpdate(const std::string& region);

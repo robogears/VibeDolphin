@@ -5,8 +5,10 @@
 
 #include <cstddef>
 #include <functional>
+#include <optional>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 #include "Common/CommonTypes.h"
 #include "Core/IOS/ES/Formats.h"
@@ -43,6 +45,63 @@ bool InstallWAD(IOS::HLE::Kernel& ios, const DiscIO::VolumeWAD& wad, InstallType
 // Same as the above, but constructs a temporary IOS and VolumeWAD instance for importing
 // and does a permanent install.
 bool InstallWAD(const std::string& wad_path);
+
+// Forwarder channels: fake-signed Wii channel titles that appear as tiles in the
+// emulated Wii System Menu; their launch is intercepted by the ES hook and
+// redirected to boot the mapped disc image (see SetForwarderBootHandler).
+struct ForwarderInfo
+{
+  u64 title_id;
+  std::string game_id;
+  u16 revision;
+};
+struct ForwarderLibraryEntry
+{
+  std::string disc_path;
+  std::string long_name;
+};
+
+// Deterministic, file-location-independent forwarder title id for a disc identity.
+u64 ComputeForwarderTitleId(const std::string& game_id, u16 revision);
+// True if title_id is in our forwarder-channel namespace.
+bool IsForwarderTitle(u64 title_id);
+
+// Build + install one forwarder for a Wii disc image (uses the disc's own
+// opening.bnr as the banner). Returns its info, or nullopt (non-Wii / no banner).
+std::optional<ForwarderInfo> InstallForwarder(const std::string& disc_path);
+// Install forwarders for a whole library and persist the title-id -> path map.
+// Returns the number installed.
+size_t InstallForwardersForLibrary(const std::vector<ForwarderLibraryEntry>& games);
+
+// Remove a forwarder channel from NAND (title dir + ticket). No-op + false for any
+// title id outside our forwarder namespace (never deletes real titles).
+bool UninstallForwarder(u64 title_id);
+
+struct ForwarderSyncResult
+{
+  size_t installed = 0;
+  size_t already_present = 0;
+  size_t moved = 0;
+  size_t uninstalled = 0;
+  size_t orphaned = 0;
+  bool map_modified = false;
+};
+// Incrementally reconcile installed forwarders with the given set of disc paths:
+// install newly-added games, drop removed ones, follow moved/renamed files, and
+// persist the map only if it changed. Safe to call off the UI thread; runs at most
+// one reconcile at a time (extra concurrent calls return immediately).
+ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& current_disc_paths);
+
+// Look up a forwarder's disc path (lazy-loads forwarders.json); used by the ES hook.
+std::optional<std::string> LookupForwarderDiscPath(u64 title_id);
+// Invalidate the cached map so the next lookup reloads (after (re)generating).
+void ReloadForwarderMap();
+
+// (DEV/spike) Forwarder launch -> host disc boot bridge. The frontend registers a
+// handler that boots the given disc image (replacing the current session); the ES
+// launch interception calls RequestForwarderBoot when a forwarder title launches.
+void SetForwarderBootHandler(std::function<void(const std::string& disc_path)> handler);
+void RequestForwarderBoot(const std::string& disc_path);
 
 bool UninstallTitle(u64 title_id);
 

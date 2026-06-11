@@ -86,6 +86,7 @@ constexpr std::array<const char*, NUM_HOTKEYS> s_hotkey_labels{{
     _trans("Toggle SD Card"),
     _trans("Toggle USB Keyboard"),
     _trans("Toggle Wii Speak Mute"),
+    _trans("Return to Wii Menu"),
 
     _trans("Next Profile"),
     _trans("Previous Profile"),
@@ -305,7 +306,7 @@ constexpr std::array<HotkeyGroupInfo, NUM_HOTKEY_GROUPS> s_groups_info = {
      {_trans("Stepping"), HK_STEP, HK_SKIP},
      {_trans("Program Counter"), HK_SHOW_PC, HK_SET_PC},
      {_trans("Breakpoint"), HK_BP_TOGGLE, HK_MBP_ADD},
-     {_trans("Wii"), HK_TRIGGER_SYNC_BUTTON, HK_TOGGLE_WII_SPEAK_MUTE},
+     {_trans("Wii"), HK_TRIGGER_SYNC_BUTTON, HK_RETURN_TO_WII_MENU},
      {_trans("Controller Profile 1"), HK_NEXT_WIIMOTE_PROFILE_1, HK_PREV_GAME_WIIMOTE_PROFILE_1},
      {_trans("Controller Profile 2"), HK_NEXT_WIIMOTE_PROFILE_2, HK_PREV_GAME_WIIMOTE_PROFILE_2},
      {_trans("Controller Profile 3"), HK_NEXT_WIIMOTE_PROFILE_3, HK_PREV_GAME_WIIMOTE_PROFILE_3},

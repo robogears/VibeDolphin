@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <fstream>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -12,6 +13,7 @@
 #include <fmt/format.h>
 
 #include "Common/ChunkFile.h"
+#include "Common/FileUtil.h"
 #include "Common/Logging/Log.h"
 #include "Common/MsgHandler.h"
 #include "Common/NandPaths.h"
@@ -30,6 +32,7 @@
 #include "Core/IOS/Uids.h"
 #include "Core/IOS/VersionInfo.h"
 #include "Core/System.h"
+#include "Core/WiiUtils.h"
 #include "DiscIO/Enums.h"
 
 namespace IOS::HLE
@@ -481,6 +484,25 @@ bool ESDevice::LaunchPPCTitle(u64 title_id)
   ES::Content content;
   if (!tmd.GetContent(tmd.GetBootIndex(), &content))
     return false;
+
+  // Forwarder interception: by now the IOS reload above has reset-and-paused the PPC
+  // (it would be released by BootstrapPPC below). If this title is one of our forwarder
+  // channels, leave the PPC paused and ask the host to reboot into the mapped disc image
+  // instead of bootstrapping the channel's (banner) content. Intercepting HERE rather
+  // than at function entry is what keeps the emulated System Menu cleanly halted during
+  // the swap (intercepting at entry skipped the reload/pause and crashed the menu).
+  if (WiiUtils::IsForwarderTitle(title_id))
+  {
+    if (const auto disc_path = WiiUtils::LookupForwarderDiscPath(title_id))
+    {
+      NOTICE_LOG_FMT(IOS_ES, "Forwarder launch intercepted ({:016x}); booting disc: {}", title_id,
+                     *disc_path);
+      WiiUtils::RequestForwarderBoot(*disc_path);
+      return true;
+    }
+    WARN_LOG_FMT(IOS_ES, "Forwarder title {:016x} not in map; ignoring launch", title_id);
+    return false;
+  }
 
   m_pending_ppc_boot_content_path = m_core.GetContentPath(tmd.GetTitleId(), content);
   if (!Core::IsRunning(system))
