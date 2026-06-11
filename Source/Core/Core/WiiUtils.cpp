@@ -97,14 +97,6 @@ std::atomic<bool> s_brick_handled_this_boot{false};
 // launches; REGEN_PENDING is the one-shot "rebuild now" flag set on a brick.
 const char* const SAFE_MODE_MARKER = "forwarder_safe_mode";
 const char* const REGEN_PENDING_MARKER = "forwarder_regen_pending";
-// The auto-learned quarantine list: game ids whose banner crashed the Wii Menu, one per line
-// ('#' = comment). Lives in the user dir alongside forwarder_blocklist.txt; each listed game gets
-// a yellow "image not loaded" caution tile (its launch shortcut is unaffected). The user can
-// delete this file to clear all auto-detected crashers.
-const char* const QUARANTINE_FILE = "wii_menu_quarantine.txt";
-// Volatile marker holding the title id of the last forwarder banner the System Menu opened during
-// a menu boot; read once on a brick to attribute the crash to a single game, then deleted.
-const char* const LAST_BANNER_MARKER = "forwarder_last_banner_tid";
 
 // Parse a hex title id from a (possibly hand-edited / truncated) JSON string. Non-throwing
 // (Core is built with -fno-exceptions, so std::stoull on bad input would terminate); returns
@@ -186,16 +178,6 @@ bool WriteForwarderMap(const std::vector<ForwarderMapEntry>& entries)
   doc["version"] = picojson::value(1.0);
   doc["forwarders"] = picojson::value(rows);
   return JsonToFile(File::GetUserPath(D_USER_IDX) + "forwarders.json", picojson::value(doc), true);
-}
-
-// Resolve a forwarder title id back to its game id via the persisted map. Used to attribute a
-// menu brick (which only knows the crashing title id) to a quarantinable game id.
-std::optional<std::string> LookupForwarderGameId(u64 title_id)
-{
-  for (const ForwarderMapEntry& e : LoadForwarderMapFull())
-    if (e.title_id == title_id && !e.game_id.empty())
-      return e.game_id;
-  return std::nullopt;
 }
 
 // Retail Wii common key (identical to the one in IOSC). Used to AES-128-CBC
@@ -303,18 +285,15 @@ const std::vector<u8>* GetDonorBanner()
   return s_donor_banner ? &*s_donor_banner : nullptr;
 }
 
-// Games to show a yellow "image not loaded" caution tile for instead of attempting real art.
-// The set is the union of the manual user list forwarder_blocklist.txt and the auto-learned
-// wii_menu_quarantine.txt (crashers the menu self-detects at runtime). Both live in the user dir,
-// one game id per line ('#' = comment), and either can be deleted to reset. There are NO built-in
-// entries: the list starts empty and is populated only by the user or by runtime auto-detection
-// (no banner is ever used verbatim, so an un-flagged game can't brick the menu -- worst case its
-// art can't be decoded and it falls back to the safe donor tile).
+// Games to show a yellow "image not loaded" caution tile for, instead of their real banner. The
+// set is a small built-in seed of confirmed Wii-Menu-crashers -- Mario Party 9, all regions, the
+// one game known to brick the channel grid -- plus the user-editable forwarder_blocklist.txt (one
+// game id per line, '#' = comment). If some OTHER game ever crashes the menu, add its id to that
+// file to give it a caution tile too; delete the file to clear your additions.
 //
-// The cache is rebuilt lazily and explicitly invalidated by InvalidateBannerBlocklist() (after a
-// quarantine write and at the start of each sync), so a newly quarantined game -- or a user who
-// deleted the list -- takes effect without a relaunch. The mutex guards cross-thread access: a
-// brick on the CPU thread can add to the list while the forwarder sync (worker thread) reads it.
+// Cached, and invalidated by InvalidateBannerBlocklist() at the start of each sync so an edit to
+// the file takes effect without a relaunch. The mutex guards cross-thread access (the forwarder
+// sync reads this from a worker thread).
 std::mutex s_blocklist_mutex;
 std::optional<std::set<std::string>> s_blocklist_cache;
 
@@ -323,64 +302,26 @@ bool IsBannerBlocklisted(const std::string& game_id)
   std::lock_guard<std::mutex> lock(s_blocklist_mutex);
   if (!s_blocklist_cache)
   {
-    std::set<std::string> set;  // no built-in entries; learned from the user/auto files below
-    for (const char* name : {"forwarder_blocklist.txt", QUARANTINE_FILE})
+    // Mario Party 9 (USA/Asia, Europe, Japan, Korea) -- the confirmed channel-grid crasher.
+    std::set<std::string> set{"SSQE01", "SSQP01", "SSQJ01", "SSQK01"};
+    std::ifstream file(File::GetUserPath(D_USER_IDX) + "forwarder_blocklist.txt");
+    for (std::string line; std::getline(file, line);)
     {
-      std::ifstream file(File::GetUserPath(D_USER_IDX) + name);
-      for (std::string line; std::getline(file, line);)
-      {
-        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
-          line.pop_back();
-        if (!line.empty() && line.front() != '#')
-          set.insert(line);
-      }
+      while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
+        line.pop_back();
+      if (!line.empty() && line.front() != '#')
+        set.insert(line);
     }
     s_blocklist_cache = std::move(set);
   }
   return s_blocklist_cache->count(game_id) != 0;
 }
 
-// Drop the cached blocklist so the next IsBannerBlocklisted re-reads the files from disk.
+// Drop the cached blocklist so the next IsBannerBlocklisted re-reads forwarder_blocklist.txt.
 void InvalidateBannerBlocklist()
 {
   std::lock_guard<std::mutex> lock(s_blocklist_mutex);
   s_blocklist_cache.reset();
-}
-
-// Append a game id to the auto-learned quarantine list (deduped). Called when a menu brick is
-// attributed to a specific game; on the next launch (or the next sync) its tile is rebuilt as a
-// caution placeholder.
-void AddToQuarantine(const std::string& game_id)
-{
-  if (game_id.empty())
-    return;
-  const std::string path = File::GetUserPath(D_USER_IDX) + QUARANTINE_FILE;
-  std::ifstream in(path);
-  for (std::string line; std::getline(in, line);)
-  {
-    while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
-      line.pop_back();
-    if (line == game_id)
-      return;  // already quarantined
-  }
-  in.close();
-  const bool existed = File::Exists(path);
-  std::ofstream out(path, std::ios::app);
-  if (!out)
-  {
-    WARN_LOG_FMT(IOS_ES, "Could not write quarantine file {}", path);
-    return;
-  }
-  if (!existed)
-  {
-    out << "# VibeDolphin: games whose banner crashed the Wii Menu (auto-detected).\n"
-           "# Each gets a yellow \"image not loaded\" tile; the game still launches.\n"
-           "# Delete this file to clear the list and try real art again.\n";
-  }
-  out << game_id << "\n";
-  out.close();
-  InvalidateBannerBlocklist();  // so this session's next sync recognizes the new entry
-  INFO_LOG_FMT(IOS_ES, "Wii Menu: quarantined {} (caution tile on next launch)", game_id);
 }
 
 // Read the disc's own opening.bnr verbatim (full per-game art: real icon + animation).
@@ -673,43 +614,10 @@ bool IsSafeBannerMode()
 }
 void SetWiiMenuBootPending(bool pending)
 {
-  // Clear any stale "last banner read" marker when arming, so a brick is attributed only to a
-  // forwarder banner opened during THIS menu boot, and reset the once-per-boot brick guard.
+  // Reset the once-per-boot brick guard when arming a fresh menu boot.
   if (pending)
-  {
-    File::Delete(File::GetUserPath(D_USER_IDX) + LAST_BANNER_MARKER);
     s_brick_handled_this_boot.store(false);
-  }
   s_wii_menu_boot_pending.store(pending);
-}
-
-void NoteForwarderBannerRead(u64 title_id, u16 content_index)
-{
-  // Crash-culprit attribution: while the System Menu is booting, record the forwarder whose
-  // banner (content index 0) was most recently opened. If the menu then bricks, the panic handler
-  // blames this title. Gated so ordinary content reads and non-forwarder titles are ignored; the
-  // marker is overwritten on each banner open, ending up as the last one read before the crash.
-  if (!s_wii_menu_boot_pending.load() || content_index != 0 || !IsForwarderTitle(title_id))
-    return;
-  std::ofstream out(File::GetUserPath(D_USER_IDX) + LAST_BANNER_MARKER, std::ios::trunc);
-  if (out)
-    out << fmt::format("{:016x}", title_id);
-}
-
-// Read (and delete) the last-banner-read marker, returning the forwarder title id if one was
-// recorded this boot. nullopt if the file is missing/empty (crash before any forwarder banner).
-static std::optional<u64> ConsumeLastBannerTid()
-{
-  const std::string path = File::GetUserPath(D_USER_IDX) + LAST_BANNER_MARKER;
-  std::string s;
-  {
-    std::ifstream in(path);
-    std::getline(in, s);
-  }
-  File::Delete(path);
-  while (!s.empty() && (s.back() == '\r' || s.back() == ' ' || s.back() == '\t'))
-    s.pop_back();
-  return ParseHexTitleId(s);  // nullopt for empty / non-hex
 }
 
 bool NotePanicMessageMaybeBrick(const char* text)
@@ -717,9 +625,9 @@ bool NotePanicMessageMaybeBrick(const char* text)
   if (!s_wii_menu_boot_pending.load() || text == nullptr)
     return false;
   const std::string_view msg(text);
-  // Memory-access panics carry "PC = 0x..."; match that (plus the English wording) so we
-  // catch the brick regardless of UI translation. Gated on the menu-boot window above, so
-  // a normal game's stray fault is never misattributed.
+  // Memory-access panics carry "PC = 0x..."; match that (plus the English wording) so we catch the
+  // brick regardless of UI translation. Gated on the menu-boot window above, so a normal game's
+  // stray fault is never misattributed.
   if (msg.find("PC = 0x") == std::string_view::npos &&
       msg.find("Invalid read") == std::string_view::npos &&
       msg.find("Invalid write") == std::string_view::npos)
@@ -727,38 +635,22 @@ bool NotePanicMessageMaybeBrick(const char* text)
     return false;
   }
   // A bad banner can fault repeatedly (a garbage-pointer loop spewing many panics). Act on the
-  // FIRST one only; suppress the rest. Re-entry would consume an already-empty attribution marker
-  // and wrongly trip the "unknown culprit -> blanket safe mode" backstop. Returning true still
-  // suppresses each flood panic's dialog while the watchdog stops the wedged menu.
+  // FIRST one only; suppress the rest (return true without re-processing) so the flood neither
+  // spams dialogs nor re-runs the heal. Reset per boot in SetWiiMenuBootPending.
   if (s_brick_handled_this_boot.exchange(true))
     return true;
+  // We can't reliably tell WHICH banner crashed -- the System Menu reads every banner before it
+  // renders them, so "the last one read" is not the culprit (guessing wrongly quarantined an
+  // innocent game). So don't guess: switch to blanket safe-banner mode (the next launch rebuilds
+  // every tile as a safe placeholder, so the menu boots cleanly) and request that one-shot
+  // rebuild. The user pins the offending game by adding its id to forwarder_blocklist.txt -- it
+  // then gets a caution tile while every other game keeps its real banner.
   const std::string dir = File::GetUserPath(D_USER_IDX);
-  // Attribute the crash to the last forwarder banner the menu opened. If we can name the culprit,
-  // quarantine ONLY that game (caution tile next launch) and leave every other tile's real art
-  // untouched. If we can't, fall back to blanket safe-banner mode so the menu at least boots.
-  // Either way, request a one-shot rebuild on the next launch.
-  std::optional<std::string> culprit;
-  if (const std::optional<u64> tid = ConsumeLastBannerTid())
-    culprit = LookupForwarderGameId(*tid);
+  File::CreateEmptyFile(dir + SAFE_MODE_MARKER);
   File::CreateEmptyFile(dir + REGEN_PENDING_MARKER);
-  // Loop-safety cap. Quarantine the culprit ONLY if it's a freshly-blamed game. If we can't name a
-  // culprit, OR the blamed game was ALREADY quarantined (its tile is the safe caution one, so a
-  // repeat crash means the attribution isn't resolving the real cause), fall back to blanket
-  // safe-banner mode so the menu can't crash-loop. Blanket mode is sticky: it persists until the
-  // user clears it (delete <user>/forwarder_safe_mode, and optionally wii_menu_quarantine.txt).
-  if (culprit && !IsBannerBlocklisted(*culprit))
-  {
-    AddToQuarantine(*culprit);
-    WARN_LOG_FMT(IOS_ES, "Wii Menu banner brick: quarantined culprit {} for relaunch", *culprit);
-  }
-  else
-  {
-    File::CreateEmptyFile(dir + SAFE_MODE_MARKER);
-    s_safe_banner_mode.store(true);
-    WARN_LOG_FMT(IOS_ES, "Wii Menu banner brick: unresolved (culprit={}); blanket safe-banner mode",
-                 culprit.value_or("unknown"));
-  }
+  s_safe_banner_mode.store(true);
   s_wii_menu_brick_detected.store(true);
+  WARN_LOG_FMT(IOS_ES, "Wii Menu banner brick detected; engaging safe-banner mode for relaunch");
   return true;
 }
 

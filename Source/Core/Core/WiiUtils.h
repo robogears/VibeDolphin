@@ -99,16 +99,11 @@ bool IsSafeBannerMode();
 // stray "Invalid read" panic during that window is attributed to the channel grid (and not
 // to a normal game, which may legitimately fault).
 void SetWiiMenuBootPending(bool pending);
-// Called from ES when a title's content is opened. While a Wii Menu boot is pending, records the
-// forwarder whose banner (content index 0) was last read, so a subsequent brick can be blamed on
-// that specific game. A no-op for non-forwarder titles, non-banner content, or outside the boot
-// window -- safe and cheap to call on every content open.
-void NoteForwarderBannerRead(u64 title_id, u16 content_index);
 // Called from the panic handler. If a Wii Menu boot is pending and |text| is an invalid
-// memory-access panic, this attributes the crash to the last forwarder banner read (quarantining
-// just that game) or, if it can't, falls back to blanket safe-banner mode; it persists the regen
-// marker, flags an in-session brick for the frontend, and returns true so the caller suppresses
-// the dialog spam.
+// memory-access panic, this engages blanket safe-banner mode for the next launch (the System Menu
+// reads all banners before rendering, so the crashing one can't be reliably identified), persists
+// the regen marker, flags an in-session brick for the frontend, and returns true so the caller
+// suppresses the dialog spam (including the flood a single bad banner can produce).
 bool NotePanicMessageMaybeBrick(const char* text);
 // Atomically take the "a brick was just detected this session" flag (frontend polls this).
 bool ConsumeWiiMenuBrickDetected();

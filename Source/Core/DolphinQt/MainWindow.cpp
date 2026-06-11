@@ -1727,6 +1727,11 @@ void MainWindow::ArmWiiMenuBrickWatchdog()
 
 void MainWindow::BootWiiSystemMenu()
 {
+  // Apply any pending heal BEFORE booting. A brick sets a one-shot regen marker; the kiosk path
+  // already consumes it pre-boot, but a desktop "Load Wii System Menu" must too -- otherwise a
+  // crashing banner is never rebuilt between menu boots and it just keeps crashing (an infinite
+  // loop). Synchronous so the rebuild finishes before the menu reads the banners.
+  RunForwarderSyncImpl(/*synchronous=*/true, /*user_invoked=*/false);
   ArmWiiMenuBrickWatchdog();
   StartGame(std::make_unique<BootParameters>(BootParameters::NANDTitle{Titles::SYSTEM_MENU}));
 }
@@ -1747,10 +1752,10 @@ void MainWindow::OnWiiMenuBannerBrick()
   }
   ModalMessageBox::warning(
       this, tr("Wii Menu"),
-      tr("A channel banner crashed the Wii Menu's channel grid.\n\nVibeDolphin has flagged the "
-         "game that caused it. The next time you open the Wii Menu, its tile will show an \"image "
-         "not loaded\" placeholder (the game still launches), and your other channels are "
-         "unaffected."));
+      tr("A channel banner crashed the Wii Menu's channel grid.\n\nVibeDolphin has switched to safe "
+         "placeholder tiles so it boots cleanly next time. To give the offending game an \"image "
+         "not loaded\" tile while every other game keeps its real banner, add its game ID to "
+         "forwarder_blocklist.txt in your VibeDolphin user folder (one ID per line)."));
 }
 
 void MainWindow::RunForwarderSync()
