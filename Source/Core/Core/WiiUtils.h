@@ -83,10 +83,11 @@ struct ForwarderSyncResult
 // install newly-added games, drop removed ones, follow moved/renamed files, and
 // persist the map only if it changed. Safe to call off the UI thread; runs at most
 // one reconcile at a time (extra concurrent calls return immediately).
-// If |force_reinstall| is true, every forwarder is uninstalled and rebuilt (used by the
-// crash self-heal to regenerate all banners after switching to safe-banner mode).
+// |force_reinstall| (the post-brick heal) rebuilds only the quarantined games as caution tiles,
+// keeping every other tile. |full_rebuild| (the one-time migration / --generate-forwarders)
+// rebuilds ALL forwarders from scratch. The first sync after upgrading forces a full rebuild once.
 ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& current_disc_paths,
-                                              bool force_reinstall = false);
+                                              bool force_reinstall = false, bool full_rebuild = false);
 
 // --- Wii Menu crash safety net (next-launch self-heal) ---------------------------------
 // When a channel banner bricks the System Menu's grid renderer (a null-read panic), we
@@ -94,9 +95,6 @@ ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& cu
 // the menu boots cleanly. "Safe-banner mode" forces InstallForwarder to skip per-game art.
 void SetSafeBannerMode(bool enabled);
 bool IsSafeBannerMode();
-// Clears the sticky safe-banner state (deletes the persistent marker + resets the flag). Called
-// after the one-shot heal regen so a blanket safe rebuild can't permanently disable per-game art.
-void ClearSafeBannerMode();
 // The frontend sets this true while the emulated System Menu is the running session, so a
 // stray "Invalid read" panic during that window is attributed to the channel grid (and not
 // to a normal game, which may legitimately fault).

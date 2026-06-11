@@ -216,7 +216,7 @@ int main(int argc, char* argv[])
     const std::vector<std::string_view> dir_views(dirs.begin(), dirs.end());
     const std::vector<std::string> paths = UICommon::FindAllGamePaths(dir_views, true);
     const WiiUtils::ForwarderSyncResult result =
-        WiiUtils::SyncForwardersWithLibrary(paths, /*force_reinstall=*/true);
+        WiiUtils::SyncForwardersWithLibrary(paths, /*force_reinstall=*/true, /*full_rebuild=*/true);
     return result.installed > 0 ? 0 : 1;
   }
 

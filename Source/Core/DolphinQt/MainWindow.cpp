@@ -1803,11 +1803,6 @@ void MainWindow::RunForwarderSyncImpl(bool synchronous, bool user_invoked)
     const std::vector<std::string> paths = UICommon::FindAllGamePaths(dir_views, true);
     const WiiUtils::ForwarderSyncResult result =
         WiiUtils::SyncForwardersWithLibrary(paths, force_reinstall);
-    // The heal regen is one-shot: clear the sticky safe-mode marker so future launches restore
-    // real per-game art for non-crashing games (a blanket safe rebuild, if any, was a one-time
-    // fallback). Quarantined crashers keep their caution tiles via the persistent quarantine file.
-    if (force_reinstall)
-      WiiUtils::ClearSafeBannerMode();
     if (user_invoked)
       QueueOnObject(this, [this, result] { ShowForwarderSyncResult(result); });
   };

@@ -298,11 +298,13 @@ const std::vector<u8>* GetDonorBanner()
   return s_donor_banner ? &*s_donor_banner : nullptr;
 }
 
-// Games whose disc opening.bnr crashes the System Menu's channel-grid renderer when reused as a
-// channel banner; these get a yellow "image not loaded" caution tile instead of real art. The set
-// is the union of: a built-in seed of known-bad ids; the manual user list forwarder_blocklist.txt;
-// and the auto-learned wii_menu_quarantine.txt (crashers detected at runtime). All live in the
-// user dir, one game id per line ('#' = comment), and either file can be deleted to reset.
+// Games to show a yellow "image not loaded" caution tile for instead of attempting real art.
+// The set is the union of the manual user list forwarder_blocklist.txt and the auto-learned
+// wii_menu_quarantine.txt (crashers the menu self-detects at runtime). Both live in the user dir,
+// one game id per line ('#' = comment), and either can be deleted to reset. There are NO built-in
+// entries: the list starts empty and is populated only by the user or by runtime auto-detection
+// (no banner is ever used verbatim, so an un-flagged game can't brick the menu -- worst case its
+// art can't be decoded and it falls back to the safe donor tile).
 //
 // The cache is rebuilt lazily and explicitly invalidated by InvalidateBannerBlocklist() (after a
 // quarantine write and at the start of each sync), so a newly quarantined game -- or a user who
@@ -316,7 +318,7 @@ bool IsBannerBlocklisted(const std::string& game_id)
   std::lock_guard<std::mutex> lock(s_blocklist_mutex);
   if (!s_blocklist_cache)
   {
-    std::set<std::string> set{"SSQE01"};  // Mario Party 9 (USA, Asia)
+    std::set<std::string> set;  // no built-in entries; learned from the user/auto files below
     for (const char* name : {"forwarder_blocklist.txt", QUARANTINE_FILE})
     {
       std::ifstream file(File::GetUserPath(D_USER_IDX) + name);
@@ -664,14 +666,6 @@ bool IsSafeBannerMode()
 {
   return s_safe_banner_mode.load();
 }
-void ClearSafeBannerMode()
-{
-  // Clear the sticky safe-banner state once the heal regen has run, so a one-time blanket safe
-  // rebuild (the unattributed-brick fallback) never permanently disables real per-game art for
-  // future installs. The persistent marker is never otherwise deleted.
-  File::Delete(File::GetUserPath(D_USER_IDX) + SAFE_MODE_MARKER);
-  s_safe_banner_mode.store(false);
-}
 void SetWiiMenuBootPending(bool pending)
 {
   // Clear any stale "last banner read" marker when arming, so a brick is attributed only to a
@@ -733,7 +727,12 @@ bool NotePanicMessageMaybeBrick(const char* text)
   if (const std::optional<u64> tid = ConsumeLastBannerTid())
     culprit = LookupForwarderGameId(*tid);
   File::CreateEmptyFile(dir + REGEN_PENDING_MARKER);
-  if (culprit)
+  // Loop-safety cap. Quarantine the culprit ONLY if it's a freshly-blamed game. If we can't name a
+  // culprit, OR the blamed game was ALREADY quarantined (its tile is the safe caution one, so a
+  // repeat crash means the attribution isn't resolving the real cause), fall back to blanket
+  // safe-banner mode so the menu can't crash-loop. Blanket mode is sticky: it persists until the
+  // user clears it (delete <user>/forwarder_safe_mode, and optionally wii_menu_quarantine.txt).
+  if (culprit && !IsBannerBlocklisted(*culprit))
   {
     AddToQuarantine(*culprit);
     WARN_LOG_FMT(IOS_ES, "Wii Menu banner brick: quarantined culprit {} for relaunch", *culprit);
@@ -742,7 +741,8 @@ bool NotePanicMessageMaybeBrick(const char* text)
   {
     File::CreateEmptyFile(dir + SAFE_MODE_MARKER);
     s_safe_banner_mode.store(true);
-    WARN_LOG_FMT(IOS_ES, "Wii Menu banner brick: culprit unknown; blanket safe-banner mode");
+    WARN_LOG_FMT(IOS_ES, "Wii Menu banner brick: unresolved (culprit={}); blanket safe-banner mode",
+                 culprit.value_or("unknown"));
   }
   s_wii_menu_brick_detected.store(true);
   return true;
@@ -826,30 +826,29 @@ std::optional<ForwarderInfo> InstallForwarder(const std::string& disc_path)
     return std::nullopt;
   }
 
-  // Build the channel banner. Every path re-hosts art inside the known-good donor scene so the
-  // renderer only ever walks the donor's BRLYT/BRLAN -- no game's banner can brick the menu:
-  //  * a normal game gets its OWN art (BuildArtChannelBanner) -> real per-game tile;
-  //  * a blocklisted/quarantined game (its banner is a known menu-crasher) gets a yellow
-  //    "image not loaded" caution tile (BuildCautionBanner), keeping the correct game name;
-  //  * either falls back to the plain donor scene + game titles (BuildSafeBanner) if art can't be
-  //    built. With no donor at all the game is skipped (no tile). Gated on the toolkit self-test.
+  // Build the channel banner:
+  //  * a normal game gets its OWN real banner verbatim -> truest per-game art. If that banner
+  //    crashes the System Menu, the self-heal attributes the crash to this game, quarantines it,
+  //    and it becomes a caution tile on the next launch ("crash once to auto-find the bad game").
+  //  * a flagged game (manual blocklist or runtime auto-quarantine) gets the yellow "image not
+  //    loaded" caution tile, built on the proven-safe donor scene so it can't brick.
+  //  * with no readable game banner, or while in blanket safe-banner mode (the loop backstop),
+  //    falls back to the plain donor tile. With no donor at all the game is skipped (no tile).
   static const bool s_banner_tools_ok = Banner::RunSelfTests();
   const std::vector<u8>* const donor = GetDonorBanner();
   const std::optional<std::vector<u8>> game_bnr = ReadFullBanner(*volume, partition);
   const bool blocklisted = IsBannerBlocklisted(game_id);
   std::optional<std::vector<u8>> banner;
-  if (donor && s_banner_tools_ok && game_bnr && !IsSafeBannerMode() && !blocklisted)
-    banner = Banner::BuildArtChannelBanner(*donor, *game_bnr);  // real per-game art
-  if (!banner && donor && s_banner_tools_ok && game_bnr && blocklisted)
+  if (game_bnr && !blocklisted && !IsSafeBannerMode())
+    banner = *game_bnr;  // the game's own real banner (verbatim); auto-quarantine is the safety net
+  if (!banner && blocklisted && donor && s_banner_tools_ok && game_bnr)
     banner = Banner::BuildCautionBanner(*donor, *game_bnr);  // yellow "image not loaded" tile
   if (!banner && donor)
-    banner = BuildSafeBanner(*volume, partition);  // donor scene + game titles only
+    banner = BuildSafeBanner(*volume, partition);  // plain donor scene + game titles (safe fallback)
   if (!banner)
   {
-    // Fail safe: never fall back to the game's verbatim opening.bnr -- that is the
-    // banner-brick path. With no donor we skip the game (no tile) instead. EnsureDonorBanner
-    // (run at the start of the sync) tries to capture a donor so this rarely happens.
-    WARN_LOG_FMT(IOS_ES, "Forwarder: '{}' ({}) - no safe banner (donor missing?); skipping",
+    WARN_LOG_FMT(IOS_ES,
+                 "Forwarder: '{}' ({}) - no usable banner (no game banner / no donor); skipping",
                  disc_path, game_id);
     return std::nullopt;
   }
@@ -931,7 +930,7 @@ bool UninstallForwarder(u64 title_id)
 }
 
 ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& current_disc_paths,
-                                              bool force_reinstall)
+                                              bool force_reinstall, bool full_rebuild)
 {
   ForwarderSyncResult result;
   if (s_forwarder_sync_running.exchange(true))
@@ -944,6 +943,27 @@ ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& cu
   // Re-read the blocklist from disk so a just-quarantined game (or a user-deleted list) is
   // honored this run, even on an in-session Tools > Sync without a relaunch.
   InvalidateBannerBlocklist();
+
+  // One-time migration to the real-banner model: the first sync after upgrading rebuilds every
+  // tile so games installed by older versions as plain-donor switch to their own real banner (and
+  // any banner that crashes the menu then goes through the auto-quarantine flow). Runs once.
+  const std::string migrated_marker = File::GetUserPath(D_USER_IDX) + "forwarder_realart_migrated";
+  if (!File::Exists(migrated_marker))
+  {
+    full_rebuild = true;
+    File::CreateEmptyFile(migrated_marker);
+  }
+
+  // A full rebuild -- the one-time migration or an explicit --generate-forwarders -- reinstalls
+  // every tile with its real banner, so it also clears any sticky blanket safe-banner state. This
+  // is the user's clean "retry real art" path after the crash-loop backstop has engaged (a
+  // genuinely unresolvable crash simply re-engages it). The auto-heal (force_reinstall WITHOUT
+  // full_rebuild) deliberately does NOT clear it, so the backstop stays put and can't oscillate.
+  if (full_rebuild)
+  {
+    File::Delete(File::GetUserPath(D_USER_IDX) + SAFE_MODE_MARKER);
+    s_safe_banner_mode.store(false);
+  }
 
   // Phase 0: make sure a donor banner exists (capture one from a known-safe game if not), so
   // the crash-proof banner pipeline has a host scene. Without it, games are skipped, not bricked.
@@ -959,15 +979,16 @@ ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& cu
     old_by_tid.emplace(e.title_id, e);
   }
 
-  // Force regen (crash self-heal). Two modes:
-  //  * Blanket (safe-banner mode -- a brick we couldn't attribute to one game): drop every
-  //    forwarder so all tiles are rebuilt as plain safe donors. Last resort to make the menu boot.
-  //  * Selective (a specific game was attributed/blocklisted): drop ONLY the quarantined games so
-  //    they're rebuilt as caution tiles, while every other game keeps its existing real-art tile
-  //    untouched (its path stays in old_by_path -> kept as-is below). This is the common path.
-  if (force_reinstall)
+  // Force regen. Two modes:
+  //  * Blanket (full_rebuild -- the one-time migration or an explicit --generate-forwarders, OR
+  //    safe-banner mode): drop EVERY forwarder and rebuild them all. Banner type then follows the
+  //    mode: real verbatim banners normally, or plain safe donors while in safe-banner mode.
+  //  * Selective (the post-brick heal): drop ONLY the quarantined games so they're rebuilt as
+  //    caution tiles, while every other game keeps its existing real banner untouched (its path
+  //    stays in old_by_path -> kept as-is below). This is the common heal path.
+  if (force_reinstall || full_rebuild)
   {
-    const bool blanket = IsSafeBannerMode();
+    const bool blanket = full_rebuild || IsSafeBannerMode();
     IOS::HLE::Kernel ios;
     for (const u64 tid : ios.GetESCore().GetInstalledTitles())
     {

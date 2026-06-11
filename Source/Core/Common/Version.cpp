@@ -25,7 +25,7 @@ const std::string& GetScmRevStr()
   // About dialog. (The upstream Dolphin git-describe is still available via GetScmDescStr()
   // / GetScmRevGitStr(); the network User-Agent below keeps EMULATOR_NAME so online updates
   // / NUS are unaffected.)
-  static const std::string scm_rev_str = "VibeDolphin 0.1.7";
+  static const std::string scm_rev_str = "VibeDolphin 0.1.8";
   return scm_rev_str;
 }
 
