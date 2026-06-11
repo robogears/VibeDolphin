@@ -364,6 +364,9 @@ MainWindow::MainWindow(Core::System& system, std::unique_ptr<BootParameters> boo
       QApplication::processEvents();
       RunForwarderSyncImpl(/*synchronous=*/true, /*user_invoked=*/false);
       splash.close();
+      // Arm the brick watchdog: the kiosk boots the menu via m_pending_boot below (not
+      // BootWiiSystemMenu), so without this the crash-attribution + self-heal would never run.
+      ArmWiiMenuBrickWatchdog();
     }
   }
   else
@@ -1699,11 +1702,12 @@ void MainWindow::PerformOnlineUpdate(const std::string& region)
   Settings::Instance().NANDRefresh();
 }
 
-void MainWindow::BootWiiSystemMenu()
+void MainWindow::ArmWiiMenuBrickWatchdog()
 {
-  // Arm the banner-brick watchdog. While the System Menu is the running session, a null-read
-  // panic is attributed to the channel grid: the panic handler suppresses the dialog spam
-  // and flags it here; we then stop cleanly and rebuild safe banners on the next launch.
+  // While the System Menu is the running session, a null-read panic is attributed to the channel
+  // grid: the panic handler records the culprit + suppresses the dialog spam and flags a brick;
+  // the timer polls that flag and stops cleanly so the next launch self-heals. MUST be armed for
+  // BOTH the GUI "Load Wii System Menu" path and the kiosk auto-boot, or the crash isn't caught.
   WiiUtils::SetWiiMenuBootPending(true);
   if (!m_wii_menu_brick_timer)
   {
@@ -1719,6 +1723,11 @@ void MainWindow::BootWiiSystemMenu()
     });
   }
   m_wii_menu_brick_timer->start();
+}
+
+void MainWindow::BootWiiSystemMenu()
+{
+  ArmWiiMenuBrickWatchdog();
   StartGame(std::make_unique<BootParameters>(BootParameters::NANDTitle{Titles::SYSTEM_MENU}));
 }
 

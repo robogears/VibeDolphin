@@ -132,6 +132,10 @@ private:
   void IncrementSelectedStateSlot();
   void DecrementSelectedStateSlot();
   void BootWiiSystemMenu();
+  // Arms the banner-brick watchdog (boot-pending flag + poll timer) so a Wii-Menu boot's crash is
+  // attributed + self-healed. Used by BOTH the GUI "Load Wii System Menu" path and the Steam Deck
+  // kiosk auto-boot (which boots the menu via m_pending_boot, not BootWiiSystemMenu).
+  void ArmWiiMenuBrickWatchdog();
   void ScheduleForwarderAutoSync();
   void RunForwarderSync();
   // Shared body for the auto-sync, the Tools-menu action, and the kiosk pre-boot sync.

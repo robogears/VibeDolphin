@@ -1,17 +1,12 @@
-# What's new in v0.1.8
+# What's new in v0.1.9
 
-VibeDolphin is a Dolphin fork that turns the emulated Wii System Menu into a launcher for your whole Wii library. This release switches every channel tile to the game's **own real banner** and makes the menu **self-sorting**: a banner that crashes the channel grid is auto-detected and replaced with a placeholder, fully automatically.
+Bug fix on top of v0.1.8's real-banner + auto-quarantine model.
 
-## Real per-game banners for everything
-- Every game now shows its **own real banner** (true icon + animation) — the most authentic art, instead of a re-hosted approximation. A one-time rebuild on first launch upgrades your existing tiles automatically.
+## The auto-quarantine now actually runs on the Steam Deck
+- **Fixed:** when launched straight into the Wii Menu (the Steam Deck / kiosk path — the normal way you launch it), the crash-detection window was never armed. So a game whose banner crashed the menu was **never detected, never quarantined, and crashed on every boot** (no `wii_menu_quarantine.txt` was written). The detection only worked from the desktop "Tools → Load Wii System Menu" path.
+- Now the kiosk boot arms the same brick watchdog as the menu path: a crashing banner is caught, the game is identified and written to `wii_menu_quarantine.txt`, the menu stops cleanly, and on the next launch that one game becomes the yellow "image not loaded" tile while everything else keeps its real banner.
 
-## Crash-once, then auto-fix
-- A few Wii games ship a banner the System Menu can't render (a long-standing "banner brick"). There's no way to know which without the menu trying — so VibeDolphin lets it crash **once**, **identifies which game** caused it, and on the next launch replaces just that game's tile with a yellow **"image not loaded"** placeholder (the game still launches). Every other tile keeps its real banner.
-- Detected crashers are recorded in `wii_menu_quarantine.txt` in VibeDolphin's user folder — delete it to reset and try real banners again.
-
-## No hardcoded assumptions + a loop backstop
-- Removed the built-in list of "known-bad" games — nothing is pre-judged; the menu learns entirely from what actually crashes.
-- Safety backstop: if the menu keeps crashing in a way that can't be pinned to one game, VibeDolphin falls back to safe placeholder tiles so you can never get stuck in a crash loop. (To retry real banners afterward, relaunch once with the `--generate-forwarders` launch option — it rebuilds every tile with its real banner.)
+Everything else is unchanged from v0.1.8 (real per-game banners, crash-once-to-quarantine, loop-safety backstop, one-time migration).
 
 ---
 
@@ -27,4 +22,4 @@ To reach the normal Dolphin interface (first-time setup or settings), set the St
 
 ---
 
-**Full Changelog**: https://github.com/robogears/VibeDolphin/commits/v0.1.8
+**Full Changelog**: https://github.com/robogears/VibeDolphin/commits/v0.1.9
