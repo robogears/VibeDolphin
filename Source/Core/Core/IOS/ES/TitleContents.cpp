@@ -11,6 +11,7 @@
 #include "Core/IOS/FS/FileSystemProxy.h"
 #include "Core/IOS/Uids.h"
 #include "Core/System.h"
+#include "Core/WiiUtils.h"
 
 namespace IOS::HLE
 {
@@ -41,6 +42,8 @@ s32 ESCore::OpenContent(const ES::TMDReader& tmd, u16 content_index, u32 uid, Ti
     INFO_LOG_FMT(IOS_ES,
                  "OpenContent: title ID {:016x}, UID {:#x}, content {:08x} (index {}) -> CFD {}",
                  title_id, uid, content.id, content_index, i);
+    // Record forwarder banner reads during a Wii Menu boot so a brick can be blamed on one game.
+    WiiUtils::NoteForwarderBannerRead(title_id, content_index);
     return static_cast<s32>(i);
   }
 

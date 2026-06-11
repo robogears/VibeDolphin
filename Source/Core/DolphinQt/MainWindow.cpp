@@ -1735,8 +1735,10 @@ void MainWindow::OnWiiMenuBannerBrick()
   }
   ModalMessageBox::warning(
       this, tr("Wii Menu"),
-      tr("A channel banner crashed the Wii Menu's channel grid.\n\nVibeDolphin has switched to "
-         "safe banners and will rebuild the channels the next time you open the Wii Menu."));
+      tr("A channel banner crashed the Wii Menu's channel grid.\n\nVibeDolphin has flagged the "
+         "game that caused it. The next time you open the Wii Menu, its tile will show an \"image "
+         "not loaded\" placeholder (the game still launches), and your other channels are "
+         "unaffected."));
 }
 
 void MainWindow::RunForwarderSync()
@@ -1789,8 +1791,9 @@ void MainWindow::RunForwarderSyncImpl(bool synchronous, bool user_invoked)
       return;  // no System Menu -> forwarder tiles can't appear; nothing to sync
     }
   }
-  // Crash self-heal: if a prior session recorded a banner brick, stay in safe-banner mode,
-  // and (once, via the one-shot regen marker) rebuild every channel with the plain donor.
+  // Crash self-heal: if a prior session recorded a banner brick, run the one-shot regen. An
+  // attributed brick quarantines just the culprit (caution tile; other tiles keep their art); an
+  // unattributed brick also set the persistent safe-mode marker -> blanket plain-donor rebuild.
   if (WiiUtils::HasSafeBannerMarker())
     WiiUtils::SetSafeBannerMode(true);
   const bool force_reinstall = WiiUtils::ConsumeBannerRegenPending();
@@ -1800,6 +1803,11 @@ void MainWindow::RunForwarderSyncImpl(bool synchronous, bool user_invoked)
     const std::vector<std::string> paths = UICommon::FindAllGamePaths(dir_views, true);
     const WiiUtils::ForwarderSyncResult result =
         WiiUtils::SyncForwardersWithLibrary(paths, force_reinstall);
+    // The heal regen is one-shot: clear the sticky safe-mode marker so future launches restore
+    // real per-game art for non-crashing games (a blanket safe rebuild, if any, was a one-time
+    // fallback). Quarantined crashers keep their caution tiles via the persistent quarantine file.
+    if (force_reinstall)
+      WiiUtils::ClearSafeBannerMode();
     if (user_invoked)
       QueueOnObject(this, [this, result] { ShowForwarderSyncResult(result); });
   };

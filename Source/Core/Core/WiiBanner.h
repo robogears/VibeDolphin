@@ -32,6 +32,15 @@ namespace WiiUtils::Banner
 std::optional<std::vector<u8>> BuildArtChannelBanner(const std::vector<u8>& donor_banner,
                                                      const std::vector<u8>& game_opening_bnr);
 
+// Build a System-Menu-safe channel banner that shows a yellow "image not loaded" caution
+// placeholder instead of real art, for a game whose own banner crashes the System Menu.
+// Reuses |donor_banner|'s proven-safe scene (so it can't brick) but paints a warning-triangle
+// placeholder into the icon/banner texture slots; the game's IMET title text is still patched in
+// from |game_opening_bnr| so the tile keeps the correct game name. Falls back to "donor scene +
+// game titles" if the placeholder can't be painted; nullopt only if |donor_banner| is unusable.
+std::optional<std::vector<u8>> BuildCautionBanner(const std::vector<u8>& donor_banner,
+                                                  const std::vector<u8>& game_opening_bnr);
+
 // Round-trips every binary primitive (LZ10 (de)compress, U8 parse/repack, IMD5 wrap,
 // TPL parse, RGB5A3/RGBA8 encode->decode). Returns true iff all self-checks pass. Used as
 // a startup sanity gate so a packing regression disables art banners instead of shipping

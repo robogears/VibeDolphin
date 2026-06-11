@@ -1,21 +1,16 @@
-# What's new in v0.1.6
+# What's new in v0.1.7
 
-VibeDolphin is a Dolphin fork that turns the emulated Wii System Menu into a launcher for your whole Wii library. This release is a robustness & polish pass (from a full code audit) on top of the 0.1.x feature set.
+VibeDolphin is a Dolphin fork that turns the emulated Wii System Menu into a launcher for your whole Wii library. This release makes the menu **self-healing per game**: a single game whose banner crashes the channel grid no longer takes the whole menu down — it's automatically flagged and replaced with a clear placeholder, while every other tile keeps its real art.
 
-## More robust, especially on a fresh install
-- **Crash-proofing now bootstraps itself.** The safe-banner system needs one known-good "donor" scene; VibeDolphin now **captures it automatically** from a common first-party game (Mario Kart Wii, Wii Sports / Resort, or New Super Mario Bros. Wii) in your library — no manual setup. If none can be built, a game is simply **skipped** (no tile) rather than risking the old menu crash.
-- A corrupt or hand-edited channel map can no longer crash the emulator (robust parsing).
+## Auto-quarantine for menu-crashing banners
+- A few Wii games ship a disc banner that the System Menu's channel grid can't render and **crashes on** (a long-standing "banner brick" — there's no way to detect it without the menu trying). VibeDolphin now **detects which game caused the crash**, records it, and on the next launch rebuilds **only that game's tile** as a yellow **"image not loaded"** caution placeholder. The tile keeps the correct game name and **still launches the game** — your other channels are untouched and keep their real art.
+- The list of flagged games lives in a plain-text file, **`wii_menu_quarantine.txt`**, in VibeDolphin's user folder. **Delete it to reset** and try real art again for everything.
 
-## Clearer feedback
-- **Tools → "Sync Wii Menu Channels"** now reports what it did ("3 added, 1 removed", or "already up to date"), and tells you *why* if it can't run (stop emulation first / no System Menu installed).
-- Booting the Wii Menu shows an **"Updating channels…"** splash so a first-run library scan doesn't look like a hang.
-- If you launch into the Wii Menu with no System Menu installed, you now get a **clear message and the normal interface** instead of a generic error.
+## Per-game art re-enabled
+- Fixed an internal self-test mismatch that was silently disabling the banner toolkit, so newly added games again get their **own per-game tile art** (now including the common CMPR texture format), with the crash-proof safe fallback intact.
 
-## Translucent tile art
-- Game banners with transparency now keep it (no more dark fringe), and tile art quantization is slightly more accurate.
-
-## Launch options
-- Launches into the Wii Menu by default once one is installed. Use **`--gui`** (Steam Launch Options) or set **`VIBEDOLPHIN_FORCE_GUI=1`** to reach the normal Dolphin interface for settings.
+## Under the hood
+- The crash self-heal now quarantines a single attributed game instead of switching every tile to a generic donor; the generic safe-mode fallback only kicks in if a crash can't be pinned to one game, and it's no longer "sticky" — it clears itself after one heal.
 
 ---
 
@@ -31,4 +26,4 @@ To reach the normal Dolphin interface (first-time setup or settings), set the St
 
 ---
 
-**Full Changelog**: https://github.com/robogears/VibeDolphin/commits/v0.1.6
+**Full Changelog**: https://github.com/robogears/VibeDolphin/commits/v0.1.7

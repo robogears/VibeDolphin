@@ -89,9 +89,17 @@ std::atomic<bool> s_wii_menu_boot_pending{false};
 std::atomic<bool> s_wii_menu_brick_detected{false};
 
 // Persistent markers under the user dir: SAFE_MODE makes safe-banner mode sticky across
-// launches; REGEN_PENDING is the one-shot "rebuild every banner now" flag set on a brick.
+// launches; REGEN_PENDING is the one-shot "rebuild now" flag set on a brick.
 const char* const SAFE_MODE_MARKER = "forwarder_safe_mode";
 const char* const REGEN_PENDING_MARKER = "forwarder_regen_pending";
+// The auto-learned quarantine list: game ids whose banner crashed the Wii Menu, one per line
+// ('#' = comment). Lives in the user dir alongside forwarder_blocklist.txt; each listed game gets
+// a yellow "image not loaded" caution tile (its launch shortcut is unaffected). The user can
+// delete this file to clear all auto-detected crashers.
+const char* const QUARANTINE_FILE = "wii_menu_quarantine.txt";
+// Volatile marker holding the title id of the last forwarder banner the System Menu opened during
+// a menu boot; read once on a brick to attribute the crash to a single game, then deleted.
+const char* const LAST_BANNER_MARKER = "forwarder_last_banner_tid";
 
 // Parse a hex title id from a (possibly hand-edited / truncated) JSON string. Non-throwing
 // (Core is built with -fno-exceptions, so std::stoull on bad input would terminate); returns
@@ -173,6 +181,16 @@ bool WriteForwarderMap(const std::vector<ForwarderMapEntry>& entries)
   doc["version"] = picojson::value(1.0);
   doc["forwarders"] = picojson::value(rows);
   return JsonToFile(File::GetUserPath(D_USER_IDX) + "forwarders.json", picojson::value(doc), true);
+}
+
+// Resolve a forwarder title id back to its game id via the persisted map. Used to attribute a
+// menu brick (which only knows the crashing title id) to a quarantinable game id.
+std::optional<std::string> LookupForwarderGameId(u64 title_id)
+{
+  for (const ForwarderMapEntry& e : LoadForwarderMapFull())
+    if (e.title_id == title_id && !e.game_id.empty())
+      return e.game_id;
+  return std::nullopt;
 }
 
 // Retail Wii common key (identical to the one in IOSC). Used to AES-128-CBC
@@ -280,25 +298,82 @@ const std::vector<u8>* GetDonorBanner()
   return s_donor_banner ? &*s_donor_banner : nullptr;
 }
 
-// Games whose disc opening.bnr crashes the System Menu's channel-grid renderer when
-// reused as a channel banner; we fall back to the safe donor tile for these. Seeded
-// with known-bad ids, and extended via the optional file <user>/forwarder_blocklist.txt
-// (one game id per line, '#' for comments) so users can flag a bad game without a rebuild.
+// Games whose disc opening.bnr crashes the System Menu's channel-grid renderer when reused as a
+// channel banner; these get a yellow "image not loaded" caution tile instead of real art. The set
+// is the union of: a built-in seed of known-bad ids; the manual user list forwarder_blocklist.txt;
+// and the auto-learned wii_menu_quarantine.txt (crashers detected at runtime). All live in the
+// user dir, one game id per line ('#' = comment), and either file can be deleted to reset.
+//
+// The cache is rebuilt lazily and explicitly invalidated by InvalidateBannerBlocklist() (after a
+// quarantine write and at the start of each sync), so a newly quarantined game -- or a user who
+// deleted the list -- takes effect without a relaunch. The mutex guards cross-thread access: a
+// brick on the CPU thread can add to the list while the forwarder sync (worker thread) reads it.
+std::mutex s_blocklist_mutex;
+std::optional<std::set<std::string>> s_blocklist_cache;
+
 bool IsBannerBlocklisted(const std::string& game_id)
 {
-  static const std::set<std::string> s_blocklist = [] {
+  std::lock_guard<std::mutex> lock(s_blocklist_mutex);
+  if (!s_blocklist_cache)
+  {
     std::set<std::string> set{"SSQE01"};  // Mario Party 9 (USA, Asia)
-    std::ifstream file(File::GetUserPath(D_USER_IDX) + "forwarder_blocklist.txt");
-    for (std::string line; std::getline(file, line);)
+    for (const char* name : {"forwarder_blocklist.txt", QUARANTINE_FILE})
     {
-      while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
-        line.pop_back();
-      if (!line.empty() && line.front() != '#')
-        set.insert(line);
+      std::ifstream file(File::GetUserPath(D_USER_IDX) + name);
+      for (std::string line; std::getline(file, line);)
+      {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
+          line.pop_back();
+        if (!line.empty() && line.front() != '#')
+          set.insert(line);
+      }
     }
-    return set;
-  }();
-  return s_blocklist.count(game_id) != 0;
+    s_blocklist_cache = std::move(set);
+  }
+  return s_blocklist_cache->count(game_id) != 0;
+}
+
+// Drop the cached blocklist so the next IsBannerBlocklisted re-reads the files from disk.
+void InvalidateBannerBlocklist()
+{
+  std::lock_guard<std::mutex> lock(s_blocklist_mutex);
+  s_blocklist_cache.reset();
+}
+
+// Append a game id to the auto-learned quarantine list (deduped). Called when a menu brick is
+// attributed to a specific game; on the next launch (or the next sync) its tile is rebuilt as a
+// caution placeholder.
+void AddToQuarantine(const std::string& game_id)
+{
+  if (game_id.empty())
+    return;
+  const std::string path = File::GetUserPath(D_USER_IDX) + QUARANTINE_FILE;
+  std::ifstream in(path);
+  for (std::string line; std::getline(in, line);)
+  {
+    while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
+      line.pop_back();
+    if (line == game_id)
+      return;  // already quarantined
+  }
+  in.close();
+  const bool existed = File::Exists(path);
+  std::ofstream out(path, std::ios::app);
+  if (!out)
+  {
+    WARN_LOG_FMT(IOS_ES, "Could not write quarantine file {}", path);
+    return;
+  }
+  if (!existed)
+  {
+    out << "# VibeDolphin: games whose banner crashed the Wii Menu (auto-detected).\n"
+           "# Each gets a yellow \"image not loaded\" tile; the game still launches.\n"
+           "# Delete this file to clear the list and try real art again.\n";
+  }
+  out << game_id << "\n";
+  out.close();
+  InvalidateBannerBlocklist();  // so this session's next sync recognizes the new entry
+  INFO_LOG_FMT(IOS_ES, "Wii Menu: quarantined {} (caution tile on next launch)", game_id);
 }
 
 // Read the disc's own opening.bnr verbatim (full per-game art: real icon + animation).
@@ -589,9 +664,50 @@ bool IsSafeBannerMode()
 {
   return s_safe_banner_mode.load();
 }
+void ClearSafeBannerMode()
+{
+  // Clear the sticky safe-banner state once the heal regen has run, so a one-time blanket safe
+  // rebuild (the unattributed-brick fallback) never permanently disables real per-game art for
+  // future installs. The persistent marker is never otherwise deleted.
+  File::Delete(File::GetUserPath(D_USER_IDX) + SAFE_MODE_MARKER);
+  s_safe_banner_mode.store(false);
+}
 void SetWiiMenuBootPending(bool pending)
 {
+  // Clear any stale "last banner read" marker when arming, so a brick is attributed only to a
+  // forwarder banner opened during THIS menu boot.
+  if (pending)
+    File::Delete(File::GetUserPath(D_USER_IDX) + LAST_BANNER_MARKER);
   s_wii_menu_boot_pending.store(pending);
+}
+
+void NoteForwarderBannerRead(u64 title_id, u16 content_index)
+{
+  // Crash-culprit attribution: while the System Menu is booting, record the forwarder whose
+  // banner (content index 0) was most recently opened. If the menu then bricks, the panic handler
+  // blames this title. Gated so ordinary content reads and non-forwarder titles are ignored; the
+  // marker is overwritten on each banner open, ending up as the last one read before the crash.
+  if (!s_wii_menu_boot_pending.load() || content_index != 0 || !IsForwarderTitle(title_id))
+    return;
+  std::ofstream out(File::GetUserPath(D_USER_IDX) + LAST_BANNER_MARKER, std::ios::trunc);
+  if (out)
+    out << fmt::format("{:016x}", title_id);
+}
+
+// Read (and delete) the last-banner-read marker, returning the forwarder title id if one was
+// recorded this boot. nullopt if the file is missing/empty (crash before any forwarder banner).
+static std::optional<u64> ConsumeLastBannerTid()
+{
+  const std::string path = File::GetUserPath(D_USER_IDX) + LAST_BANNER_MARKER;
+  std::string s;
+  {
+    std::ifstream in(path);
+    std::getline(in, s);
+  }
+  File::Delete(path);
+  while (!s.empty() && (s.back() == '\r' || s.back() == ' ' || s.back() == '\t'))
+    s.pop_back();
+  return ParseHexTitleId(s);  // nullopt for empty / non-hex
 }
 
 bool NotePanicMessageMaybeBrick(const char* text)
@@ -609,11 +725,26 @@ bool NotePanicMessageMaybeBrick(const char* text)
     return false;
   }
   const std::string dir = File::GetUserPath(D_USER_IDX);
-  File::CreateEmptyFile(dir + SAFE_MODE_MARKER);
+  // Attribute the crash to the last forwarder banner the menu opened. If we can name the culprit,
+  // quarantine ONLY that game (caution tile next launch) and leave every other tile's real art
+  // untouched. If we can't, fall back to blanket safe-banner mode so the menu at least boots.
+  // Either way, request a one-shot rebuild on the next launch.
+  std::optional<std::string> culprit;
+  if (const std::optional<u64> tid = ConsumeLastBannerTid())
+    culprit = LookupForwarderGameId(*tid);
   File::CreateEmptyFile(dir + REGEN_PENDING_MARKER);
-  s_safe_banner_mode.store(true);
+  if (culprit)
+  {
+    AddToQuarantine(*culprit);
+    WARN_LOG_FMT(IOS_ES, "Wii Menu banner brick: quarantined culprit {} for relaunch", *culprit);
+  }
+  else
+  {
+    File::CreateEmptyFile(dir + SAFE_MODE_MARKER);
+    s_safe_banner_mode.store(true);
+    WARN_LOG_FMT(IOS_ES, "Wii Menu banner brick: culprit unknown; blanket safe-banner mode");
+  }
   s_wii_menu_brick_detected.store(true);
-  WARN_LOG_FMT(IOS_ES, "Wii Menu banner brick detected; engaging safe-banner mode for relaunch");
   return true;
 }
 
@@ -695,19 +826,22 @@ std::optional<ForwarderInfo> InstallForwarder(const std::string& disc_path)
     return std::nullopt;
   }
 
-  // Build the channel banner. The safe path re-hosts the game's own artwork inside a
-  // known-good donor scene (BuildArtChannelBanner): the renderer only ever walks the
-  // donor's BRLYT/BRLAN, so no game's banner can brick the menu, yet each tile shows real
-  // per-game art. Falls back to the plain donor tile if art extraction fails, the game is
-  // explicitly blocklisted, or the banner toolkit's startup self-test didn't pass.
+  // Build the channel banner. Every path re-hosts art inside the known-good donor scene so the
+  // renderer only ever walks the donor's BRLYT/BRLAN -- no game's banner can brick the menu:
+  //  * a normal game gets its OWN art (BuildArtChannelBanner) -> real per-game tile;
+  //  * a blocklisted/quarantined game (its banner is a known menu-crasher) gets a yellow
+  //    "image not loaded" caution tile (BuildCautionBanner), keeping the correct game name;
+  //  * either falls back to the plain donor scene + game titles (BuildSafeBanner) if art can't be
+  //    built. With no donor at all the game is skipped (no tile). Gated on the toolkit self-test.
   static const bool s_banner_tools_ok = Banner::RunSelfTests();
   const std::vector<u8>* const donor = GetDonorBanner();
+  const std::optional<std::vector<u8>> game_bnr = ReadFullBanner(*volume, partition);
+  const bool blocklisted = IsBannerBlocklisted(game_id);
   std::optional<std::vector<u8>> banner;
-  if (donor && s_banner_tools_ok && !IsSafeBannerMode() && !IsBannerBlocklisted(game_id))
-  {
-    if (const std::optional<std::vector<u8>> game_bnr = ReadFullBanner(*volume, partition))
-      banner = Banner::BuildArtChannelBanner(*donor, *game_bnr);
-  }
+  if (donor && s_banner_tools_ok && game_bnr && !IsSafeBannerMode() && !blocklisted)
+    banner = Banner::BuildArtChannelBanner(*donor, *game_bnr);  // real per-game art
+  if (!banner && donor && s_banner_tools_ok && game_bnr && blocklisted)
+    banner = Banner::BuildCautionBanner(*donor, *game_bnr);  // yellow "image not loaded" tile
   if (!banner && donor)
     banner = BuildSafeBanner(*volume, partition);  // donor scene + game titles only
   if (!banner)
@@ -807,6 +941,10 @@ ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& cu
   }
   const Common::ScopeGuard running_guard{[] { s_forwarder_sync_running.store(false); }};
 
+  // Re-read the blocklist from disk so a just-quarantined game (or a user-deleted list) is
+  // honored this run, even on an in-session Tools > Sync without a relaunch.
+  InvalidateBannerBlocklist();
+
   // Phase 0: make sure a donor banner exists (capture one from a known-safe game if not), so
   // the crash-proof banner pipeline has a host scene. Without it, games are skipped, not bricked.
   EnsureDonorBanner(current_disc_paths);
@@ -821,19 +959,38 @@ ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& cu
     old_by_tid.emplace(e.title_id, e);
   }
 
-  // Force regen (crash self-heal): drop every installed forwarder so each game is rebuilt
-  // from scratch in the current banner mode. Clearing the old maps makes every current path
-  // take the full (re)install path below instead of being kept as-is.
+  // Force regen (crash self-heal). Two modes:
+  //  * Blanket (safe-banner mode -- a brick we couldn't attribute to one game): drop every
+  //    forwarder so all tiles are rebuilt as plain safe donors. Last resort to make the menu boot.
+  //  * Selective (a specific game was attributed/blocklisted): drop ONLY the quarantined games so
+  //    they're rebuilt as caution tiles, while every other game keeps its existing real-art tile
+  //    untouched (its path stays in old_by_path -> kept as-is below). This is the common path.
   if (force_reinstall)
   {
+    const bool blanket = IsSafeBannerMode();
     IOS::HLE::Kernel ios;
     for (const u64 tid : ios.GetESCore().GetInstalledTitles())
     {
-      if (IsForwarderTitle(tid))
+      if (!IsForwarderTitle(tid))
+        continue;
+      const auto e = old_by_tid.find(tid);
+      const bool quarantined = e != old_by_tid.end() && IsBannerBlocklisted(e->second.game_id);
+      if (blanket || quarantined)
         UninstallForwarder(tid);
     }
-    old_by_path.clear();
-    old_by_tid.clear();
+    if (blanket)
+    {
+      old_by_path.clear();
+      old_by_tid.clear();
+    }
+    else
+    {
+      // Drop only the quarantined entries from the "keep" maps so they take the reinstall path.
+      for (auto it = old_by_path.begin(); it != old_by_path.end();)
+        it = IsBannerBlocklisted(it->second.game_id) ? old_by_path.erase(it) : std::next(it);
+      for (auto it = old_by_tid.begin(); it != old_by_tid.end();)
+        it = IsBannerBlocklisted(it->second.game_id) ? old_by_tid.erase(it) : std::next(it);
+    }
   }
 
   // Phases 2-3: classify each current library path into the desired set.

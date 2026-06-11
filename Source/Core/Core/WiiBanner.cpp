@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <optional>
 #include <string>
@@ -131,13 +132,9 @@ constexpr u8 QuantizeTo(u32 v8, u32 max)
   return static_cast<u8>((v8 * max + 127) / 255);
 }
 
-bool CanEncode(u32 format)
-{
-  return format == FMT_RGB5A3 || format == FMT_RGBA8;
-}
 bool CanDecode(u32 format)
 {
-  return format == FMT_RGB5A3 || format == FMT_RGBA8 || format == FMT_RGB565;
+  return format == FMT_RGB5A3 || format == FMT_RGBA8 || format == FMT_RGB565 || format == FMT_CMPR;
 }
 
 // ---------------------------------------------------------------------------
@@ -158,17 +155,19 @@ std::optional<Image> DecodeTexture(u32 format, u32 w, u32 h, const u8* data, siz
   if (TextureDataSize(format, w, h) != data_size || data_size == 0)
     return std::nullopt;
 
-  const u32 aw = Common::AlignUp(w, 4);
-  const u32 ah = Common::AlignUp(h, 4);
-  std::vector<u32> padded(size_t{aw} * ah);
+  // Decode into a block-padded buffer (4x4 tiles, or 8x8 for CMPR), then crop to w x h.
+  const u32 block = (format == FMT_CMPR) ? 8u : 4u;
+  const u32 pw = Common::AlignUp(w, block);
+  const u32 ph = Common::AlignUp(h, block);
+  std::vector<u32> padded(size_t{pw} * ph);
 
   if (format == FMT_RGB5A3)
   {
     // Decode locally (NOT Common::Decode5A3Image, which discards alpha by pre-blending
     // translucent pixels against black) so the game's transparency survives the round-trip.
     size_t s = 0;
-    for (u32 y = 0; y < ah; y += 4)
-      for (u32 x = 0; x < aw; x += 4)
+    for (u32 y = 0; y < ph; y += 4)
+      for (u32 x = 0; x < pw; x += 4)
         for (u32 iy = 0; iy < 4; ++iy)
           for (u32 ix = 0; ix < 4; ++ix, s += 2)
           {
@@ -188,14 +187,14 @@ std::optional<Image> DecodeTexture(u32 format, u32 w, u32 h, const u8* data, siz
               g = Conv4To8((v >> 4) & 0xF);
               b = Conv4To8(v & 0xF);
             }
-            padded[(y + iy) * aw + (x + ix)] = (a << 24) | (r << 16) | (g << 8) | b;
+            padded[(y + iy) * pw + (x + ix)] = (a << 24) | (r << 16) | (g << 8) | b;
           }
   }
   else if (format == FMT_RGB565)
   {
     size_t s = 0;
-    for (u32 y = 0; y < ah; y += 4)
-      for (u32 x = 0; x < aw; x += 4)
+    for (u32 y = 0; y < ph; y += 4)
+      for (u32 x = 0; x < pw; x += 4)
         for (u32 iy = 0; iy < 4; ++iy)
           for (u32 ix = 0; ix < 4; ++ix, s += 2)
           {
@@ -203,14 +202,14 @@ std::optional<Image> DecodeTexture(u32 format, u32 w, u32 h, const u8* data, siz
             const u32 r = Conv5To8((v >> 11) & 0x1F);
             const u32 g = Conv6To8((v >> 5) & 0x3F);
             const u32 b = Conv5To8(v & 0x1F);
-            padded[(y + iy) * aw + (x + ix)] = 0xFF000000u | (r << 16) | (g << 8) | b;
+            padded[(y + iy) * pw + (x + ix)] = 0xFF000000u | (r << 16) | (g << 8) | b;
           }
   }
   else if (format == FMT_RGBA8)
   {
     size_t t = 0;
-    for (u32 y = 0; y < ah; y += 4)
-      for (u32 x = 0; x < aw; x += 4, t += 64)
+    for (u32 y = 0; y < ph; y += 4)
+      for (u32 x = 0; x < pw; x += 4, t += 64)
         for (u32 iy = 0; iy < 4; ++iy)
           for (u32 ix = 0; ix < 4; ++ix)
           {
@@ -219,9 +218,58 @@ std::optional<Image> DecodeTexture(u32 format, u32 w, u32 h, const u8* data, siz
             const u8 r = data[t + 2 * idx + 1];
             const u8 g = data[t + 32 + 2 * idx];
             const u8 bch = data[t + 32 + 2 * idx + 1];
-            padded[(y + iy) * aw + (x + ix)] =
+            padded[(y + iy) * pw + (x + ix)] =
                 (u32{a} << 24) | (u32{r} << 16) | (u32{g} << 8) | bch;
           }
+  }
+  else if (format == FMT_CMPR)
+  {
+    // GameCube/Wii CMPR (S3TC/DXT1 variant): 8x8 macroblocks, each four 4x4 DXT1 sub-blocks
+    // in TL,TR,BL,BR order; per-block colors are big-endian 565 and indices are MSB-first.
+    // (Ported from VideoCommon TextureDecoder, re-mapped to our 0xAARRGGBB convention.)
+    const auto mk = [](u32 r, u32 g, u32 b, u32 a) { return (a << 24) | (r << 16) | (g << 8) | b; };
+    const auto blend = [](int v1, int v2) { return (v1 * 3 + v2 * 5) >> 3; };
+    const auto dxt = [&](u32* dst, const u8* blk) {
+      const u16 c1 = static_cast<u16>((blk[0] << 8) | blk[1]);
+      const u16 c2 = static_cast<u16>((blk[2] << 8) | blk[3]);
+      const int r1 = Conv5To8((c1 >> 11) & 0x1F), g1 = Conv6To8((c1 >> 5) & 0x3F),
+                b1 = Conv5To8(c1 & 0x1F);
+      const int r2 = Conv5To8((c2 >> 11) & 0x1F), g2 = Conv6To8((c2 >> 5) & 0x3F),
+                b2 = Conv5To8(c2 & 0x1F);
+      u32 col[4];
+      col[0] = mk(r1, g1, b1, 255);
+      col[1] = mk(r2, g2, b2, 255);
+      if (c1 > c2)
+      {
+        col[2] = mk(blend(r2, r1), blend(g2, g1), blend(b2, b1), 255);
+        col[3] = mk(blend(r1, r2), blend(g1, g2), blend(b1, b2), 255);
+      }
+      else
+      {
+        col[2] = mk((r1 + r2) / 2, (g1 + g2) / 2, (b1 + b2) / 2, 255);
+        col[3] = mk((r1 + r2) / 2, (g1 + g2) / 2, (b1 + b2) / 2, 0);  // transparent
+      }
+      for (int yy = 0; yy < 4; ++yy)
+      {
+        int val = blk[4 + yy];
+        for (int xx = 0; xx < 4; ++xx)
+        {
+          dst[xx] = col[(val >> 6) & 3];
+          val <<= 2;
+        }
+        dst += pw;
+      }
+    };
+    size_t s = 0;
+    for (u32 y = 0; y < ph; y += 8)
+      for (u32 x = 0; x < pw; x += 8)
+      {
+        dxt(&padded[size_t{y} * pw + x], data + s);
+        dxt(&padded[size_t{y} * pw + x + 4], data + s + 8);
+        dxt(&padded[size_t{y + 4} * pw + x], data + s + 16);
+        dxt(&padded[size_t{y + 4} * pw + x + 4], data + s + 24);
+        s += 32;
+      }
   }
   else
   {
@@ -234,7 +282,7 @@ std::optional<Image> DecodeTexture(u32 format, u32 w, u32 h, const u8* data, siz
   img.px.resize(size_t{w} * h);
   for (u32 y = 0; y < h; ++y)
     for (u32 x = 0; x < w; ++x)
-      img.px[y * w + x] = padded[y * aw + x];
+      img.px[y * w + x] = padded[y * pw + x];
   return img;
 }
 
@@ -331,6 +379,29 @@ std::vector<u8> EncodeTexture(u32 format, const Image& img)
   return out;
 }
 
+// Build a standalone single-texture .tpl file (header + image header + encoded pixels) for the
+// given format/dimensions. Used to rebuild a donor texture slot with the game's art.
+std::vector<u8> BuildTpl(u32 format, const Image& img)
+{
+  const std::vector<u8> pixels = EncodeTexture(format, img);
+  std::vector<u8> tpl(0x40 + pixels.size(), 0);
+  WU32(tpl, 0x00, TPL_MAGIC);
+  WU32(tpl, 0x04, 1);     // one image
+  WU32(tpl, 0x08, 0x0C);  // image-table offset
+  WU32(tpl, 0x0C, 0x14);  // image-header offset
+  WU32(tpl, 0x10, 0);     // no palette
+  tpl[0x14] = static_cast<u8>(img.h >> 8);  // image header @0x14: height, width, format, data off
+  tpl[0x15] = static_cast<u8>(img.h);
+  tpl[0x16] = static_cast<u8>(img.w >> 8);
+  tpl[0x17] = static_cast<u8>(img.w);
+  WU32(tpl, 0x18, format);
+  WU32(tpl, 0x1C, 0x40);  // data offset
+  WU32(tpl, 0x28, 1);     // min filter = GX_LINEAR
+  WU32(tpl, 0x2C, 1);     // mag filter = GX_LINEAR
+  std::copy(pixels.begin(), pixels.end(), tpl.begin() + 0x40);
+  return tpl;
+}
+
 // ---------------------------------------------------------------------------
 // Nintendo LZ10 (de)compression. We never need real compression: an all-literal
 // stream (every flag bit 0) is a valid type-0x10 stream, so "recompress" just
@@ -351,13 +422,15 @@ std::optional<std::vector<u8>> LzDecompress(const std::vector<u8>& p, LzVariant*
     *variant = LzVariant::Uncompressed;
     return p;
   }
+  // The CX LZ10 header is [0x10 method byte][24-bit uncompressed size, little-endian],
+  // optionally preceded by a 4-byte "LZ77" magic. `hdr` indexes the method byte.
   size_t hdr;
-  if (InBounds(p, 0, 8) && RU32(p, 0) == LZ77_MAGIC && (p[7] == 0x10))
+  if (InBounds(p, 0, 8) && RU32(p, 0) == LZ77_MAGIC && p[4] == 0x10)
   {
     *variant = LzVariant::Lz77Magic;
     hdr = 4;
   }
-  else if (InBounds(p, 0, 4) && p[3] == 0x10)
+  else if (InBounds(p, 0, 4) && p[0] == 0x10)
   {
     *variant = LzVariant::Lz10Bare;
     hdr = 0;
@@ -367,7 +440,7 @@ std::optional<std::vector<u8>> LzDecompress(const std::vector<u8>& p, LzVariant*
     return std::nullopt;
   }
 
-  const size_t out_size = p[hdr] | (p[hdr + 1] << 8) | (p[hdr + 2] << 16);
+  const size_t out_size = p[hdr + 1] | (p[hdr + 2] << 8) | (p[hdr + 3] << 16);
   if (out_size == 0 || out_size > 4 * 1024 * 1024)
     return std::nullopt;
   std::vector<u8> out;
@@ -419,10 +492,10 @@ std::vector<u8> LzCompressAllLiteral(const std::vector<u8>& raw, LzVariant varia
     out.push_back('7');
   }
   const size_t n = raw.size();
+  out.push_back(0x10);  // CX LZ10 method byte first, then 24-bit size little-endian
   out.push_back(static_cast<u8>(n));
   out.push_back(static_cast<u8>(n >> 8));
   out.push_back(static_cast<u8>(n >> 16));
-  out.push_back(0x10);
   for (size_t i = 0; i < n;)
   {
     out.push_back(0x00);  // 8 literals follow
@@ -668,20 +741,36 @@ std::optional<BannerScene> OpenBannerScene(const std::vector<u8>& file)
   return BannerScene{std::move(*nodes), variant, *tpl_name, *tex};
 }
 
-// Re-host the game's primary texture art into one donor banner file (icon.bin or
-// banner.bin). Keeps the donor scene byte-identical except the primary texture's pixels.
-// Returns the rebuilt donor file bytes, or nullopt to leave the donor file unchanged.
+// Rebuild the donor banner file's largest texture slot with freshly generated pixels, keeping the
+// donor's BRLYT/BRLAN and every other texture byte-for-byte so the renderer still walks the
+// known-safe scene. |make_art(w, h)| produces the new 0xAARRGGBB image at the donor texture's
+// exact dimensions; it is encoded as an RGB5A3 TPL (the one format we both decode and encode, so
+// the slot is always rebuilt as RGB5A3 regardless of the donor's original format -- the TPL header
+// is self-describing). Returns the rebuilt file bytes, or nullopt to leave it unchanged.
+template <typename MakeArt>
+std::optional<std::vector<u8>> RebuildTextureSlot(const std::vector<u8>& donor_file, MakeArt make_art)
+{
+  std::optional<BannerScene> donor = OpenBannerScene(donor_file);
+  if (!donor)
+    return std::nullopt;
+  U8Node* donor_tpl = FindFile(donor->nodes, donor->tpl_name);
+  if (!donor_tpl)
+    return std::nullopt;
+  donor_tpl->data = BuildTpl(FMT_RGB5A3, make_art(donor->tex.width, donor->tex.height));
+  const std::vector<u8> new_scene = U8Build(donor->nodes);
+  return Imd5Wrap(LzCompressAllLiteral(new_scene, donor->variant));
+}
+
+// Re-host the game's own primary texture art into one donor banner file (icon.bin or banner.bin):
+// decode the game's largest texture, resize it to the donor slot, and rebuild that slot. Accepts
+// any decodable game format (crucially CMPR, which real banners use and we can decode but not
+// encode). nullopt leaves the donor file unchanged (-> plain-donor fallback upstream).
 std::optional<std::vector<u8>> SwapArtIntoFile(const std::vector<u8>& donor_file,
                                                const std::vector<u8>& game_file)
 {
-  std::optional<BannerScene> donor = OpenBannerScene(donor_file);
-  if (!donor || !CanEncode(donor->tex.format))
-    return std::nullopt;
   std::optional<BannerScene> game = OpenBannerScene(game_file);
   if (!game || !CanDecode(game->tex.format))
     return std::nullopt;
-
-  // Decode the game's art (re-resolve the node from the owned scene -- no dangling pointer).
   const U8Node* game_tpl = FindFile(game->nodes, game->tpl_name);
   if (!game_tpl)
     return std::nullopt;
@@ -689,21 +778,61 @@ std::optional<std::vector<u8>> SwapArtIntoFile(const std::vector<u8>& donor_file
                                  game_tpl->data.data() + game->tex.data_offset, game->tex.data_size);
   if (!art)
     return std::nullopt;
+  return RebuildTextureSlot(donor_file, [&](u32 w, u32 h) { return ResizeImage(*art, w, h); });
+}
 
-  // Resize to the donor slot and encode into the donor's format; must match byte size.
-  const Image resized = ResizeImage(*art, donor->tex.width, donor->tex.height);
-  const std::vector<u8> encoded = EncodeTexture(donor->tex.format, resized);
-  if (encoded.size() != donor->tex.data_size)
-    return std::nullopt;
+// Generate a yellow "image not loaded" caution image at the given dimensions: an amber field with
+// a black-bordered warning triangle and an exclamation mark. Used for games whose own banner
+// crashes the System Menu -- their tile shows this placeholder instead of real art, while the game
+// still launches. Drawn at the donor texture's exact size so the symbol stays crisp.
+Image MakeCautionImage(u32 w, u32 h)
+{
+  constexpr u32 kAmber = 0xFFF4B400u;  // 0xAARRGGBB: opaque caution amber
+  constexpr u32 kBlack = 0xFF000000u;
+  Image img;
+  img.w = w;
+  img.h = h;
+  img.px.assign(size_t{w} * h, kAmber);
+  if (w < 12 || h < 12)
+    return img;  // too small for detail; a solid amber tile still reads as "not loaded"
 
-  // Overwrite the donor TPL pixels in place (size unchanged), repack, re-frame as all-literal
-  // LZ10 in the donor's wrapper, and re-wrap IMD5.
-  U8Node* donor_tpl = FindFile(donor->nodes, donor->tpl_name);
-  if (!donor_tpl)
-    return std::nullopt;
-  std::copy(encoded.begin(), encoded.end(), donor_tpl->data.begin() + donor->tex.data_offset);
-  const std::vector<u8> new_scene = U8Build(donor->nodes);
-  return Imd5Wrap(LzCompressAllLiteral(new_scene, donor->variant));
+  const float fw = static_cast<float>(w), fh = static_cast<float>(h);
+  const float ax = fw * 0.5f, ay = fh * 0.12f;     // triangle apex (top center)
+  const float blx = fw * 0.10f, bly = fh * 0.88f;  // bottom-left
+  const float brx = fw * 0.90f, bry = fh * 0.88f;  // bottom-right
+  const float thick = std::max(1.5f, fw * 0.055f);
+  const auto edge = [](float px, float py, float x0, float y0, float x1, float y1) {
+    return (x1 - x0) * (py - y0) - (y1 - y0) * (px - x0);
+  };
+  const auto dist = [](float px, float py, float x0, float y0, float x1, float y1) {
+    const float dx = x1 - x0, dy = y1 - y0;
+    const float len = std::sqrt(dx * dx + dy * dy);
+    return len < 1e-3f ? 1e9f : std::fabs(dx * (y0 - py) - (x0 - px) * dy) / len;
+  };
+  const float bar_top = fh * 0.34f, bar_bot = fh * 0.64f, bar_hw = std::max(1.0f, fw * 0.04f);
+  const float dot_cy = fh * 0.74f, dot_r = std::max(1.0f, fw * 0.05f);
+  for (u32 y = 0; y < h; ++y)
+  {
+    for (u32 x = 0; x < w; ++x)
+    {
+      const float px = x + 0.5f, py = y + 0.5f;
+      const float e0 = edge(px, py, ax, ay, brx, bry);
+      const float e1 = edge(px, py, brx, bry, blx, bly);
+      const float e2 = edge(px, py, blx, bly, ax, ay);
+      const bool inside = (e0 >= 0 && e1 >= 0 && e2 >= 0) || (e0 <= 0 && e1 <= 0 && e2 <= 0);
+      if (!inside)
+        continue;  // leave the surrounding field amber
+      bool black = std::min({dist(px, py, ax, ay, brx, bry), dist(px, py, brx, bry, blx, bly),
+                             dist(px, py, blx, bly, ax, ay)}) < thick;
+      if (py >= bar_top && py <= bar_bot && std::fabs(px - ax) <= bar_hw)
+        black = true;  // exclamation bar
+      if ((px - ax) * (px - ax) + (py - dot_cy) * (py - dot_cy) <= dot_r * dot_r)
+        black = true;  // exclamation dot
+      if (black)
+        img.px[size_t{y} * w + x] = kBlack;
+    }
+  }
+  return img;
 }
 
 // Patch the game's IMET title block (10 langs) into a banner, leaving everything else.
@@ -766,6 +895,30 @@ bool Validate(const std::vector<u8>& banner)
     }
   }
   return true;
+}
+
+// Reassemble a finished banner from a (modified) outer U8 archive: IMET header with the game's
+// titles patched in and each meta file's size field fixed up, followed by the rebuilt outer
+// archive, with the IMET MD5 recomputed. Returns nullopt if the result fails structural
+// validation (caller then keeps the plain-donor fallback). Shared by the art + caution builders.
+std::optional<std::vector<u8>> ReassembleBanner(const std::vector<u8>& donor_banner,
+                                                const std::vector<u8>& game_opening_bnr,
+                                                const std::vector<U8Node>& outer_nodes)
+{
+  const std::vector<u8> new_outer = U8Build(outer_nodes);
+  std::vector<u8> result(donor_banner.begin(), donor_banner.begin() + IMET_SIZE);
+  PatchTitles(result, game_opening_bnr);
+  for (const auto& [name, off] : IMET_META_SIZE_FIELDS)
+  {
+    for (const auto& n : outer_nodes)
+      if (!n.is_dir && n.name == name)
+        WU32(result, off, static_cast<u32>(n.data.size()));
+  }
+  result.insert(result.end(), new_outer.begin(), new_outer.end());
+  FixImetMd5(result);
+  if (!Validate(result))
+    return std::nullopt;
+  return result;
 }
 
 // --- test fixtures: build a minimal-but-valid banner so the self-test can exercise the
@@ -867,24 +1020,55 @@ std::optional<std::vector<u8>> BuildArtChannelBanner(const std::vector<u8>& dono
   if (!any_swapped)
     return safe_base;
 
-  // Reassemble: IMET (titles patched) + rebuilt outer U8, with IMET size fields updated.
-  const std::vector<u8> new_outer = U8Build(*donor_outer);
-  std::vector<u8> result(donor_banner.begin(), donor_banner.begin() + IMET_SIZE);
-  PatchTitles(result, game_opening_bnr);
-  for (const auto& [name, off] : IMET_META_SIZE_FIELDS)
-  {
-    if (const U8Node* n = FindFile(*donor_outer, name))
-      WU32(result, off, static_cast<u32>(n->data.size()));
-  }
-  result.insert(result.end(), new_outer.begin(), new_outer.end());
-  FixImetMd5(result);
+  // Reassemble + validate; on any failure keep the plain-donor fallback.
+  if (auto result = ReassembleBanner(donor_banner, game_opening_bnr, *donor_outer))
+    return result;
+  WARN_LOG_FMT(IOS_ES, "Forwarder: art banner failed validation; using plain donor");
+  return safe_base;
+}
 
-  if (!Validate(result))
+std::optional<std::vector<u8>> BuildCautionBanner(const std::vector<u8>& donor_banner,
+                                                  const std::vector<u8>& game_opening_bnr)
+{
+  if (!InBounds(donor_banner, 0x40, 4) || std::memcmp(donor_banner.data() + 0x40, "IMET", 4) != 0 ||
+      donor_banner.size() <= IMET_SIZE)
   {
-    WARN_LOG_FMT(IOS_ES, "Forwarder: art banner failed validation; using plain donor");
-    return safe_base;
+    return std::nullopt;  // donor itself unusable
   }
-  return result;
+
+  // safe_base = donor scene + game titles. Always valid (the plain-donor fallback if the caution
+  // art can't be painted in -- still a safe tile, just not the yellow placeholder).
+  std::vector<u8> safe_base = donor_banner;
+  PatchTitles(safe_base, game_opening_bnr);
+  FixImetMd5(safe_base);
+
+  auto donor_outer = U8Parse({donor_banner.begin() + IMET_SIZE, donor_banner.end()});
+  if (!donor_outer)
+    return safe_base;
+
+  // Paint the caution placeholder into icon.bin (the grid tile) and banner.bin (the detail view),
+  // reusing the donor's proven scene structure so it can't brick. Generated at each slot's exact
+  // size, so no game art is decoded here.
+  bool any_swapped = false;
+  for (const char* fname : {"icon.bin", "banner.bin"})
+  {
+    U8Node* donor_file = FindFile(*donor_outer, fname);
+    if (!donor_file)
+      continue;
+    if (auto rebuilt = RebuildTextureSlot(donor_file->data,
+                                          [](u32 w, u32 h) { return MakeCautionImage(w, h); }))
+    {
+      donor_file->data = std::move(*rebuilt);
+      any_swapped = true;
+    }
+  }
+  if (!any_swapped)
+    return safe_base;
+
+  if (auto result = ReassembleBanner(donor_banner, game_opening_bnr, *donor_outer))
+    return result;
+  WARN_LOG_FMT(IOS_ES, "Forwarder: caution banner failed validation; using plain donor");
+  return safe_base;
 }
 
 bool RunSelfTests()
@@ -1034,9 +1218,10 @@ bool RunSelfTests()
     const auto tpl_name = scene ? LargestTpl(*scene) : std::nullopt;
     U8Node* tnode = tpl_name ? FindFile(*scene, *tpl_name) : nullptr;
     const auto tex = tnode ? TplPrimaryTexture(tnode->data) : std::nullopt;
-    if (!tex || tex->format != FMT_RGBA8 || tex->width != 32 || tex->height != 32)
+    // The slot is rebuilt as RGB5A3 at the donor's dimensions (BuildTpl always emits RGB5A3).
+    if (!tex || tex->format != FMT_RGB5A3 || tex->width != 32 || tex->height != 32)
     {
-      ERROR_LOG_FMT(IOS_ES, "Banner self-test: e2e donor slot not preserved");
+      ERROR_LOG_FMT(IOS_ES, "Banner self-test: e2e donor slot dims/format wrong after swap");
       return false;
     }
     const auto img = DecodeTexture(tex->format, tex->width, tex->height,
@@ -1047,6 +1232,43 @@ bool RunSelfTests()
         !near(c & 0xFF, 0x80))
     {
       ERROR_LOG_FMT(IOS_ES, "Banner self-test: e2e art swap not applied (fell back to donor)");
+      return false;
+    }
+  }
+  // Caution placeholder: build from a synthetic donor, prove it validates, carries the game's
+  // titles, and that the icon slot was rebuilt as an RGB5A3 image whose corner is amber (the
+  // caution field outside the warning triangle) -- i.e. the placeholder was painted, not a
+  // silent fallback to the plain donor.
+  {
+    const std::vector<u8> donor = MakeTestBanner(FMT_RGBA8, 32, 32, 0xFF204060, 0x11);
+    const std::vector<u8> game = MakeTestBanner(FMT_RGB5A3, 48, 48, 0xFFC0A080, 0x22);
+    const auto caution = BuildCautionBanner(donor, game);
+    if (!caution || caution->size() <= IMET_SIZE || (*caution)[IMET_TITLES_OFF] != 0x22)
+    {
+      ERROR_LOG_FMT(IOS_ES, "Banner self-test: caution build/titles failed");
+      return false;
+    }
+    const std::vector<u8> outer(caution->begin() + IMET_SIZE, caution->end());
+    auto nodes = U8Parse(outer);
+    U8Node* icon = nodes ? FindFile(*nodes, "icon.bin") : nullptr;
+    const auto payload = icon ? Imd5Payload(icon->data) : std::nullopt;
+    LzVariant v;
+    const auto scene_bytes = payload ? LzDecompress(*payload, &v) : std::nullopt;
+    auto scene = scene_bytes ? U8Parse(*scene_bytes) : std::nullopt;
+    const auto tpl_name = scene ? LargestTpl(*scene) : std::nullopt;
+    U8Node* tnode = tpl_name ? FindFile(*scene, *tpl_name) : nullptr;
+    const auto tex = tnode ? TplPrimaryTexture(tnode->data) : std::nullopt;
+    if (!tex || tex->format != FMT_RGB5A3 || tex->width != 32 || tex->height != 32)
+    {
+      ERROR_LOG_FMT(IOS_ES, "Banner self-test: caution icon slot wrong");
+      return false;
+    }
+    const auto img = DecodeTexture(tex->format, tex->width, tex->height,
+                                   tnode->data.data() + tex->data_offset, tex->data_size);
+    const u32 c = img ? img->px[0] : 0;  // top-left corner: outside the triangle -> amber
+    if (!img || ((c >> 16) & 0xFF) < 0xE0 || ((c >> 8) & 0xFF) < 0x90 || (c & 0xFF) > 0x20)
+    {
+      ERROR_LOG_FMT(IOS_ES, "Banner self-test: caution placeholder not painted");
       return false;
     }
   }
