@@ -1,273 +1,97 @@
-# Dolphin - A GameCube and Wii Emulator
+# VibeDolphin
 
-[Homepage](https://dolphin-emu.org/) | [Project Site](https://github.com/dolphin-emu/dolphin) | [Buildbot](https://dolphin.ci/) | [Forums](https://forums.dolphin-emu.org/) | [Wiki](https://wiki.dolphin-emu.org/) | [GitHub Wiki](https://github.com/dolphin-emu/dolphin/wiki) | [Issue Tracker](https://bugs.dolphin-emu.org/projects/emulator/issues) | [Coding Style](https://github.com/dolphin-emu/dolphin/blob/master/Contributing.md) | [Transifex Page](https://app.transifex.com/dolphinemu/dolphin-emu/dashboard/) | [Analytics](https://mon.dolphin-emu.org/)
+**A Dolphin fork that turns the emulated Wii System Menu into a launcher for your whole game library — every Wii disc game shows up as its own channel tile, and clicking it boots the game. Built for the Steam Deck.**
 
-Dolphin is an emulator for running GameCube and Wii games on Windows,
-Linux, macOS, and recent Android devices. It's licensed under the terms
-of the GNU General Public License, version 2 or later (GPLv2+).
+VibeDolphin is a fork of the [Dolphin](https://dolphin-emu.org/) GameCube/Wii emulator. It ships as a single Linux x86‑64 **AppImage** and is designed to be added to Steam as a non‑Steam game: launch it from Game Mode and you drop straight into the **Wii System Menu 4.3**, where your games are waiting as channels — just like a real Wii.
 
-Please read the [FAQ](https://dolphin-emu.org/docs/faq/) before using Dolphin.
+---
 
-## System Requirements
+## ⚠️ Read this first: VibeDolphin is 100% AI‑built
 
-### Desktop
+**Every line of VibeDolphin's custom code was written by AI (Claude), with little to no line‑by‑line human review.** The human "developer" directed the work and tested builds on hardware, but did not hand‑write or formally audit the code. **Treat this project with caution:**
 
-* OS
-    * Windows (10 1903 or higher).
-    * Linux.
-    * macOS (11.0 Big Sur or higher).
-    * Unix-like systems other than Linux are not officially supported but might work.
-* Processor
-    * A CPU with SSE2 support.
-    * A modern CPU (3 GHz and Dual Core, not older than 2008) is highly recommended.
-* Graphics
-    * A reasonably modern graphics card (Direct3D 11.1 / OpenGL 3.3).
-    * A graphics card that supports Direct3D 11.1 / OpenGL 4.4 is recommended.
+- **Expect bugs.** This fork modifies low‑level emulator internals — it writes to the emulated Wii **NAND**, installs **fake‑signed "forwarder" channel titles**, hooks the title‑launch path, and **replaces its own binary** when self‑updating. Mistakes in any of those can corrupt your NAND, your save data, or the app itself.
+- **Back up your data.** Before using it, back up your Wii NAND and saves. Keep your real game backups somewhere VibeDolphin doesn't touch.
+- **It downloads and runs code to update itself.** The built‑in updater fetches a new AppImage from this project's GitHub Releases and executes it (after a SHA‑256 check). If you're not comfortable with that, don't use the updater.
+- **Not affiliated with or endorsed by the Dolphin project.** Don't report VibeDolphin issues to upstream Dolphin. Don't assume upstream's quality or security guarantees apply here.
+- **Use at your own risk.** No warranty. If something breaks, you get to keep both pieces.
 
-### Android
+If that's not for you, use upstream [Dolphin](https://dolphin-emu.org/) instead — it's excellent, human‑maintained, and battle‑tested.
 
-* OS
-    * Android (7.0 Nougat or higher).
-* Processor
-    * A processor with support for 64-bit applications (either ARMv8 or x86-64).
-* Graphics
-    * A graphics processor that supports OpenGL ES 3.0 or higher. Performance varies heavily with [driver quality](https://dolphin-emu.org/blog/2013/09/26/dolphin-emulator-and-opengl-drivers-hall-fameshame/).
-    * A graphics processor that supports standard desktop OpenGL features is recommended for best performance.
+---
 
-Dolphin can only be installed on devices that satisfy the above requirements. Attempting to install on an unsupported device will fail and display an error message.
+## The main idea: your games, as channels, in the Wii Menu
 
-## Building for Windows
+On a real Wii, you turn it on and see a grid of channels. VibeDolphin recreates that feeling for your *whole library*:
 
-Use the solution file `Source/dolphin-emu.sln` to build Dolphin on Windows.
-Dolphin targets the latest MSVC shipped with Visual Studio or Build Tools.
-Other compilers might be able to build Dolphin on Windows but have not been
-tested and are not recommended to be used. Git and latest Windows SDK must be
-installed when building.
+1. You boot VibeDolphin (or launch it from Steam) and land in the emulated **Wii System Menu 4.3**.
+2. **Every Wii disc game in your library appears as a channel tile**, showing the game's own banner art.
+3. **Click a tile and that game boots** — no quitting back to Steam, no relaunching the emulator. When you're done, return to the Wii Menu and pick another game.
 
-Make sure to pull submodules before building:
+It's the cozy, console‑like front end the Wii never let you have for your backups — and it's especially at home on the Steam Deck in Game Mode with a controller.
+
+### How it works (the short version)
+
+Wii **disc** games (`.wbfs` / `.iso` / `.rvz`) can't normally appear in the Wii Menu — they run off the emulated disc drive and have no NAND channel. VibeDolphin bridges that gap:
+
+- For each game in your library it installs a tiny **forwarder channel** — a real, fake‑signed NAND title that shows up as a tile with the game's banner.
+- A small **hook in Dolphin's title‑launch path** notices when the Menu tries to launch one of these forwarders and instead reboots the emulator straight into the mapped disc image.
+- A persistent map ties each forwarder's title ID to a disc file, and the channels are re‑synced from your library so the grid stays current.
+
+The result: clicking a tile boots the right game, and you can bounce between games entirely inside the Wii Menu.
+
+## Features
+
+- **Wii Menu game launcher** — your disc games as channel tiles, with their real banner art.
+- **Steam Deck kiosk mode** — launched with no arguments (e.g. from Steam Game Mode), VibeDolphin boots **straight into the Wii Menu** once a System Menu is installed. Pass `--gui` (or set `VIBEDOLPHIN_FORCE_GUI=1`) to get the normal Dolphin interface for setup and settings.
+- **"Sync Wii Menu Channels"** — a Tools‑menu action (run automatically each launch) that reconciles the channel tiles with your current game library.
+- **Caution tiles for problem banners** — a few games' banners crash the Menu's channel grid. Such games are shown as a yellow **"image not loaded"** caution tile (the launch shortcut still works); every other game keeps its real banner. The blocklist is a built‑in entry for Mario Party 9 plus your own `forwarder_blocklist.txt` (one game ID per line) in the user folder.
+- **Built‑in self‑updater** — **Help → "Check for VibeDolphin Updates…"** checks GitHub Releases and, on the AppImage, downloads the new build, verifies its SHA‑256, swaps itself in place, and relaunches. A failed check is reported as "couldn't check," never silently treated as up‑to‑date.
+- **Everything Dolphin already does** — VibeDolphin is a normal Dolphin underneath; all the usual emulation, graphics, controller, and tooling features are intact.
+
+VibeDolphin keeps its own user folder at `~/.local/share/vibedolphin`, **separate** from any stock Dolphin install and preserved across updates.
+
+## Requirements
+
+- **Linux x86‑64** (the AppImage target; developed and tested on the **Steam Deck**).
+- A Wii **System Menu** installed in VibeDolphin's NAND. Run with `--gui`, then **Tools → Perform Online System Update** — the channel tiles render *inside* the System Menu, so one must be installed.
+- Your Wii game backups in a folder configured under **Config → Paths**.
+- You provide your own games and system files. VibeDolphin includes no copyrighted Nintendo content.
+
+## Install & use (Steam Deck)
+
+1. Download `VibeDolphin.AppImage` from the [Releases page](https://github.com/robogears/VibeDolphin/releases) into a **writable** location (e.g. `~/Applications`).
+2. Make it executable: `chmod +x VibeDolphin.AppImage`.
+3. First‑time setup (Desktop Mode): run it with `--gui`, install a Wii System Menu (**Tools → Perform Online System Update**), and set your game folder under **Config → Paths**.
+4. Add `VibeDolphin.AppImage` to Steam as a **non‑Steam game**. Launch it from Game Mode and it boots into the Wii Menu with your games as channels. (Set Steam **Launch Options** to `--gui` if you ever need the normal interface from Game Mode.)
+
+## Updating
+
+Use **Help → "Check for VibeDolphin Updates…"** (the Steam Deck kiosk also checks once before booting the Menu). Because the updater ships *inside* the app, the **first** build must be downloaded by hand once; after that VibeDolphin keeps itself current. If an update can't be applied (e.g. a read‑only location), it falls back to opening the Releases page.
+
+## Building from source
+
+VibeDolphin builds like Dolphin. To produce the Linux AppImage, use the bundled script on a Linux x86‑64 machine with the Dolphin build dependencies installed:
+
 ```sh
 git submodule update --init --recursive
+Distribution/build-appimage.sh        # writes VibeDolphin.AppImage in the repo root
 ```
 
-The "Release" solution configuration includes performance optimizations for the best user experience but complicates debugging Dolphin.
-The "Debug" solution configuration is significantly slower, more verbose and less permissive but makes debugging Dolphin easier.
+The script lists the exact `apt` dependencies in its header. For general (non‑AppImage) builds on Linux, macOS, Windows, or Android, follow upstream Dolphin's instructions — see the [Dolphin wiki](https://github.com/dolphin-emu/dolphin/wiki) and `Contributing.md`. In short, on Linux/macOS:
 
-## Building for Linux and macOS
-
-Dolphin requires [CMake](https://cmake.org/) for systems other than Windows. 
-You need a recent version of GCC or Clang with decent c++20 support. CMake will
-inform you if your compiler is too old.
-Many libraries are bundled with Dolphin and used if they're not installed on 
-your system. CMake will inform you if a bundled library is used or if you need
-to install any missing packages yourself. You may refer to the [wiki](https://github.com/dolphin-emu/dolphin/wiki/Building-for-Linux) for more information.
-
-Make sure to pull submodules before building:
 ```sh
-git submodule update --init --recursive
+mkdir build && cd build
+cmake ..
+make -j $(nproc)
 ```
 
-### macOS Build Steps:
+## Relationship to Dolphin, credits & license
 
-A binary supporting a single architecture can be built using the following steps: 
+VibeDolphin is a downstream fork of the [Dolphin Emulator](https://github.com/dolphin-emu/dolphin). All of the heavy lifting — the actual GameCube/Wii emulation — is Dolphin's work by the Dolphin team and contributors. VibeDolphin only adds the Wii‑Menu launcher, the Steam Deck kiosk flow, the caution‑tile banner handling, and the self‑updater on top.
 
-1. `mkdir build`
-2. `cd build`
-3. `cmake ..`
-4. `make -j $(sysctl -n hw.logicalcpu)`
+VibeDolphin is licensed under the **GNU General Public License, version 2 or later (GPLv2+)**, the same as Dolphin. See `COPYING` and `LICENSES/`.
 
-An application bundle will be created in `./Binaries`.
+Upstream Dolphin resources: [Homepage](https://dolphin-emu.org/) · [Project Site](https://github.com/dolphin-emu/dolphin) · [Wiki](https://wiki.dolphin-emu.org/) · [FAQ](https://dolphin-emu.org/docs/faq/) · [Issue Tracker](https://bugs.dolphin-emu.org/projects/emulator/issues)
 
-A script is also provided to build universal binaries supporting both x64 and ARM in the same
-application bundle using the following steps:
-
-1. `mkdir build`
-2. `cd build`
-3. `python ../BuildMacOSUniversalBinary.py`
-4. Universal binaries will be available in the `universal` folder
-
-Doing this is more complex as it requires installation of library dependencies for both x64 and ARM (or universal library
-equivalents) and may require specifying additional arguments to point to relevant library locations. 
-Execute BuildMacOSUniversalBinary.py --help for more details.  
-
-### Linux Global Build Steps:
-
-To install to your system.
-
-1. `mkdir build`
-2. `cd build`
-3. `cmake ..`
-4. `make -j $(nproc)`
-5. `sudo make install`
-
-### Linux Local Build Steps:
-
-Useful for development as root access is not required.
-
-1. `mkdir Build`
-2. `cd Build`
-3. `cmake .. -DLINUX_LOCAL_DEV=true`
-4. `make -j $(nproc)`
-5. `ln -s ../../Data/Sys Binaries/`
-
-### Linux Portable Build Steps:
-
-Can be stored on external storage and used on different Linux systems.
-Or useful for having multiple distinct Dolphin setups for testing/development/TAS.
-
-1. `mkdir Build`
-2. `cd Build`
-3. `cmake .. -DLINUX_LOCAL_DEV=true`
-4. `make -j $(nproc)`
-5. `cp -r ../Data/Sys/ Binaries/`
-6. `touch Binaries/portable.txt`
-
-## Building for Android
-
-These instructions assume familiarity with Android development. If you do not have an
-Android dev environment set up, see [AndroidSetup.md](AndroidSetup.md).
-
-Make sure to pull submodules before building:
-```sh
-git submodule update --init --recursive
-```
-
-If using Android Studio, import the Gradle project located in `./Source/Android`.
-
-Android apps are compiled using a build system called Gradle. Dolphin's native component,
-however, is compiled using CMake. The Gradle script will attempt to run a CMake build
-automatically while building the Java code.
-
-## Uninstalling
-
-On Windows, simply remove the extracted directory, unless it was installed with the NSIS installer,
-in which case you can uninstall Dolphin like any other Windows application.
-
-Linux users can run `cat install_manifest.txt | xargs -d '\n' rm` as root from the build directory
-to uninstall Dolphin from their system.
-
-macOS users can simply delete Dolphin.app to uninstall it.
-
-Additionally, you'll want to remove the global user directory if you don't plan on reinstalling Dolphin.
-
-## Command Line Usage
-
-```
-Usage: Dolphin.exe [options]... [FILE]...
-
-Options:
-  --version             show program's version number and exit
-  -h, --help            show this help message and exit
-  -u USER, --user=USER  User folder path
-  -m MOVIE, --movie=MOVIE
-                        Play a movie file
-  -e <file>, --exec=<file>
-                        Load the specified file
-  -n <16-character ASCII title ID>, --nand_title=<16-character ASCII title ID>
-                        Launch a NAND title
-  -C <System>.<Section>.<Key>=<Value>, --config=<System>.<Section>.<Key>=<Value>
-                        Set a configuration option
-  -s <file>, --save_state=<file>
-                        Load the initial save state
-  -d, --debugger        Show the debugger pane and additional View menu options
-  -l, --logger          Open the logger
-  -b, --batch           Run Dolphin without the user interface (Requires
-                        --exec or --nand-title)
-  -c, --confirm         Set Confirm on Stop
-  -v VIDEO_BACKEND, --video_backend=VIDEO_BACKEND
-                        Specify a video backend
-  -a AUDIO_EMULATION, --audio_emulation=AUDIO_EMULATION
-                        Choose audio emulation from [HLE|LLE]
-```
-
-Available DSP emulation engines are HLE (High Level Emulation) and
-LLE (Low Level Emulation). HLE is faster but less accurate whereas
-LLE is slower but close to perfect. Note that LLE has two submodes (Interpreter and Recompiler)
-but they cannot be selected from the command line.
-
-Available video backends are "D3D" and "D3D12" (they are only available on Windows), "OGL", and "Vulkan".
-There's also "Null", which will not render anything, and
-"Software Renderer", which uses the CPU for rendering and
-is intended for debugging purposes only.
-
-## DolphinTool Usage
-```
-usage: dolphin-tool COMMAND -h
-
-commands supported: [convert, verify, header, extract]
-```
-
-```
-Usage: convert [options]... [FILE]...
-
-Options:
-  -h, --help            show this help message and exit
-  -u USER, --user=USER  User folder path, required for temporary processing
-                        files.Will be automatically created if this option is
-                        not set.
-  -i FILE, --input=FILE
-                        Path to disc image FILE.
-  -o FILE, --output=FILE
-                        Path to the destination FILE.
-  -f FORMAT, --format=FORMAT
-                        Container format to use. Default is RVZ. [iso|gcz|wia|rvz]
-  -s, --scrub           Scrub junk data as part of conversion.
-  -b BLOCK_SIZE, --block_size=BLOCK_SIZE
-                        Block size for GCZ/WIA/RVZ formats, as an integer.
-                        Suggested value for RVZ: 131072 (128 KiB)
-  -c COMPRESSION, --compression=COMPRESSION
-                        Compression method to use when converting to WIA/RVZ.
-                        Suggested value for RVZ: zstd [none|zstd|bzip|lzma|lzma2]
-  -l COMPRESSION_LEVEL, --compression_level=COMPRESSION_LEVEL
-                        Level of compression for the selected method. Ignored
-                        if 'none'. Suggested value for zstd: 5
-```
-
-```
-Usage: verify [options]...
-
-Options:
-  -h, --help            show this help message and exit
-  -u USER, --user=USER  User folder path, required for temporary processing
-                        files.Will be automatically created if this option is
-                        not set.
-  -i FILE, --input=FILE
-                        Path to disc image FILE.
-  -a ALGORITHM, --algorithm=ALGORITHM
-                        Optional. Compute and print the digest using the
-                        selected algorithm, then exit. [crc32|md5|sha1|rchash]
-```
-
-```
-Usage: header [options]...
-
-Options:
-  -h, --help            show this help message and exit
-  -i FILE, --input=FILE
-                        Path to disc image FILE.
-  -b, --block_size      Optional. Print the block size of GCZ/WIA/RVZ formats,
-then exit.
-  -c, --compression     Optional. Print the compression method of GCZ/WIA/RVZ
-                        formats, then exit.
-  -l, --compression_level
-                        Optional. Print the level of compression for WIA/RVZ
-                        formats, then exit.
-```
-
-```
-Usage: extract [options]...
-
-Options:
-  -h, --help            show this help message and exit
-  -i FILE, --input=FILE
-                        Path to disc image FILE.
-  -o FOLDER, --output=FOLDER
-                        Path to the destination FOLDER.
-  -p PARTITION, --partition=PARTITION
-                        Which specific partition you want to extract.
-  -s SINGLE, --single=SINGLE
-                        Which specific file/directory you want to extract.
-  -l, --list            List all files in volume/partition. Will print the
-                        directory/file specified with --single if defined.
-  -q, --quiet           Mute all messages except for errors.
-  -g, --gameonly        Only extracts the DATA partition.
-```
+> Again: **this fork's code is AI‑generated and lightly reviewed.** Please report problems with VibeDolphin to *this* repository, never to upstream Dolphin, and keep backups.
