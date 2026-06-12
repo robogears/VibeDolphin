@@ -4,10 +4,17 @@
 #include "DolphinQt/VibeUpdater.h"
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <sstream>
 #include <string>
 #include <vector>
+
+#ifdef __linux__
+#include <cerrno>
+#include <cstring>
+#include <unistd.h>
+#endif
 
 #include <picojson.h>
 
@@ -143,7 +150,6 @@ bool SelfInstallAppImage(const Update& update, QWidget* parent)
   staging.setAutoRemove(false);  // the detached helper removes the staging dir after applying
   const QString staging_path = staging.path();
   const QString new_image = staging_path + QStringLiteral("/VibeDolphin.AppImage");
-  const QString script_path = staging_path + QStringLiteral("/apply-update.sh");
 
   const auto cleanup = [&] { QDir(staging_path).removeRecursively(); };
 
@@ -199,51 +205,15 @@ bool SelfInstallAppImage(const Update& update, QWidget* parent)
     }
   }
 
-  // (4) Write the swap helper. It waits for THIS process to exit, atomically replaces the running
-  //     AppImage, relaunches it, and removes the staging dir. Always relaunches so the user is
-  //     never left with a vanished app; aborts untouched if we don't exit within the wait window.
-  //     Every step is logged to $5 so a failed update is diagnosable. argv: $1=NEW $2=TARGET
-  //     $3=PID $4=DIR $5=LOG.
-  const QString script = QStringLiteral(
-      "#!/bin/bash\n"
-      "NEW=\"$1\"; TARGET=\"$2\"; PID=\"$3\"; DIR=\"$4\"; LOG=\"$5\"\n"
-      "log(){ echo \"[helper $(date '+%H:%M:%S')] $*\" >>\"$LOG\" 2>&1; }\n"
-      "log \"up: NEW=$NEW TARGET=$TARGET PID=$PID DIR=$DIR\"\n"
-      "for i in $(seq 1 120); do kill -0 \"$PID\" 2>/dev/null || break; sleep 0.5; done\n"
-      "if kill -0 \"$PID\" 2>/dev/null; then log \"PID $PID still alive after 60s; aborting\"; "
-      "rm -rf \"$DIR\"; exit 0; fi\n"
-      "log \"app exited; settling\"; sleep 1\n"
-      "chmod +x \"$NEW\" 2>/dev/null\n"
-      "if mv -f \"$NEW\" \"$TARGET\"; then log \"mv ok\"; else rc=$?; log \"mv failed rc=$rc; cp\"; "
-      "if cp -f \"$NEW\" \"$TARGET\"; then log \"cp ok\"; else log \"cp failed rc=$?\"; fi; fi\n"
-      "chmod +x \"$TARGET\" 2>/dev/null\n"
-      "log \"relaunching $TARGET\"\n"
-      "setsid \"$TARGET\" >/dev/null 2>&1 </dev/null &\n"
-      "log \"relaunch child=$!; cleaning up\"\n"
-      "rm -rf \"$DIR\"\n"
-      "log \"done\"\n");
-  {
-    QFile f(script_path);
-    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
-        f.write(script.toUtf8()) != script.toUtf8().size())
-    {
-      QMessageBox::critical(parent, QObject::tr("Update failed"),
-                            QObject::tr("Could not write the update helper."));
-      cleanup();
-      return false;
-    }
-    f.close();
-    f.setPermissions(QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
-  }
-
-  // (5) Launch the helper and quit. The log lives BESIDE the AppImage so it survives the staging
-  //     dir being removed, and we record the launch from here too -- so even if the helper is
-  //     killed before it writes anything, we can still tell it was launched and by which mechanism.
+  // (4) Replace the AppImage in place and re-exec -- NO detached helper. On the Steam Deck the
+  //     launcher (KDE's file manager, Steam) runs us in a transient systemd scope that is torn down
+  //     the instant we exit, which SIGKILLs any detached child before it can swap the binary; even
+  //     `systemd-run --user --scope` failed to escape that scope here (it reported success but the
+  //     command never ran). So we swap the file while STILL RUNNING -- the live squashfs mount
+  //     keeps the old inode, so we keep working -- then execv() the new image as THIS process:
+  //     same PID, same scope, nothing to kill mid-swap.
   const QString log_path =
       QFileInfo(appimage).absolutePath() + QStringLiteral("/vibedolphin-update.log");
-  const QString pid = QString::number(QCoreApplication::applicationPid());
-  const QStringList helper_args = {script_path, new_image, appimage, pid, staging_path, log_path};
-
   const auto append_log = [&log_path](const QString& line) {
     QFile lf(log_path);
     if (lf.open(QIODevice::Append | QIODevice::Text))
@@ -252,41 +222,48 @@ bool SelfInstallAppImage(const Update& update, QWidget* parent)
       lf.close();
     }
   };
-  append_log(QStringLiteral("[parent] launching helper: %1 -> %2\n").arg(new_image, appimage));
 
-  // Launch the helper in its OWN systemd scope: the launcher (Steam, a desktop file manager) often
-  // runs us in a transient cgroup that systemd tears down when we exit, which would SIGKILL a plain
-  // detached child before it can swap the binary. A user scope created via systemd-run is managed
-  // by the user's systemd instance, not our cgroup, so it survives. Fall back to setsid (at least a
-  // new session) and then a bare detached bash if systemd-run isn't usable.
-  QStringList sd_args = {QStringLiteral("--user"),    QStringLiteral("--scope"),
-                         QStringLiteral("--collect"), QStringLiteral("--quiet"),
-                         QStringLiteral("--"),        QStringLiteral("/bin/bash")};
-  sd_args += helper_args;
-  QString how = QStringLiteral("systemd-run");
-  bool started = QProcess::startDetached(QStringLiteral("systemd-run"), sd_args);
-  if (!started)
+  // Atomic same-filesystem replace. POSIX rename() overwrites in place; QFile::rename() refuses to
+  // when the target exists. The running process is unaffected -- it holds the old inode through the
+  // mounted squashfs.
+  const QByteArray target_c = QFile::encodeName(appimage);
+  if (std::rename(QFile::encodeName(new_image).constData(), target_c.constData()) != 0)
   {
-    how = QStringLiteral("setsid");
-    started = QProcess::startDetached(QStringLiteral("setsid"),
-                                      QStringList{QStringLiteral("/bin/bash")} + helper_args);
-  }
-  if (!started)
-  {
-    how = QStringLiteral("bash");
-    started = QProcess::startDetached(QStringLiteral("/bin/bash"), helper_args);
-  }
-  append_log(QStringLiteral("[parent] launch via %1 started=%2\n")
-                 .arg(how, started ? QStringLiteral("true") : QStringLiteral("false")));
-
-  if (!started)
-  {
+    const int e = errno;
+    append_log(QStringLiteral("[update] rename failed: %1\n")
+                   .arg(QString::fromLocal8Bit(std::strerror(e))));
     QMessageBox::critical(parent, QObject::tr("Update failed"),
-                          QObject::tr("Could not start the update helper."));
+                          QObject::tr("Could not replace the application file (%1).")
+                              .arg(QString::fromLocal8Bit(std::strerror(e))));
     cleanup();
     return false;
   }
-  QApplication::quit();  // exit so the helper's wait loop unblocks -> swap + relaunch
+  QFile::setPermissions(appimage, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner |
+                                      QFile::ReadGroup | QFile::ExeGroup | QFile::ReadOther |
+                                      QFile::ExeOther);
+  cleanup();  // the new image is in place; the (now-empty) staging dir is no longer needed
+  append_log(QStringLiteral("[update] swapped in place; re-execing %1\n").arg(appimage));
+
+  // (5) Re-exec the freshly-swapped AppImage AS THIS PROCESS. Drop the env vars the old AppRun
+  //     injected so the new AppRun starts clean (otherwise the new build could pull libraries from
+  //     the old, now-stale mount). DISPLAY / WAYLAND_DISPLAY are left intact so the window returns.
+  ::unsetenv("LD_LIBRARY_PATH");
+  ::unsetenv("QT_PLUGIN_PATH");
+  ::unsetenv("QT_QPA_PLATFORM_PLUGIN_PATH");
+  ::unsetenv("PYTHONPATH");
+  ::unsetenv("APPDIR");
+  char* const argv_exec[] = {const_cast<char*>(target_c.constData()), nullptr};
+  ::execv(target_c.constData(), argv_exec);
+
+  // execv() only returns on FAILURE. The binary is already swapped, so the user just needs to
+  // relaunch -- say so rather than leaving them staring at a closed app.
+  const int e = errno;
+  append_log(QStringLiteral("[update] execv failed: %1\n")
+                 .arg(QString::fromLocal8Bit(std::strerror(e))));
+  QMessageBox::information(
+      parent, QObject::tr("Update installed"),
+      QObject::tr("The update was installed. Please relaunch VibeDolphin to finish."));
+  QApplication::quit();
   return true;
 #else
   (void)update;
