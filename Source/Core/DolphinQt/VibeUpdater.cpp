@@ -202,16 +202,26 @@ bool SelfInstallAppImage(const Update& update, QWidget* parent)
   // (4) Write the swap helper. It waits for THIS process to exit, atomically replaces the running
   //     AppImage, relaunches it, and removes the staging dir. Always relaunches so the user is
   //     never left with a vanished app; aborts untouched if we don't exit within the wait window.
+  //     Every step is logged to $5 so a failed update is diagnosable. argv: $1=NEW $2=TARGET
+  //     $3=PID $4=DIR $5=LOG.
   const QString script = QStringLiteral(
       "#!/bin/bash\n"
-      "NEW=\"$1\"; TARGET=\"$2\"; PID=\"$3\"; DIR=\"$4\"\n"
-      "for i in $(seq 1 60); do kill -0 \"$PID\" 2>/dev/null || break; sleep 0.5; done\n"
-      "if kill -0 \"$PID\" 2>/dev/null; then rm -rf \"$DIR\"; exit 0; fi\n"
+      "NEW=\"$1\"; TARGET=\"$2\"; PID=\"$3\"; DIR=\"$4\"; LOG=\"$5\"\n"
+      "log(){ echo \"[helper $(date '+%H:%M:%S')] $*\" >>\"$LOG\" 2>&1; }\n"
+      "log \"up: NEW=$NEW TARGET=$TARGET PID=$PID DIR=$DIR\"\n"
+      "for i in $(seq 1 120); do kill -0 \"$PID\" 2>/dev/null || break; sleep 0.5; done\n"
+      "if kill -0 \"$PID\" 2>/dev/null; then log \"PID $PID still alive after 60s; aborting\"; "
+      "rm -rf \"$DIR\"; exit 0; fi\n"
+      "log \"app exited; settling\"; sleep 1\n"
       "chmod +x \"$NEW\" 2>/dev/null\n"
-      "mv -f \"$NEW\" \"$TARGET\" 2>/dev/null && chmod +x \"$TARGET\" 2>/dev/null\n"
-      "nohup \"$TARGET\" >/dev/null 2>&1 &\n"
-      "disown\n"
-      "rm -rf \"$DIR\"\n");
+      "if mv -f \"$NEW\" \"$TARGET\"; then log \"mv ok\"; else rc=$?; log \"mv failed rc=$rc; cp\"; "
+      "if cp -f \"$NEW\" \"$TARGET\"; then log \"cp ok\"; else log \"cp failed rc=$?\"; fi; fi\n"
+      "chmod +x \"$TARGET\" 2>/dev/null\n"
+      "log \"relaunching $TARGET\"\n"
+      "setsid \"$TARGET\" >/dev/null 2>&1 </dev/null &\n"
+      "log \"relaunch child=$!; cleaning up\"\n"
+      "rm -rf \"$DIR\"\n"
+      "log \"done\"\n");
   {
     QFile f(script_path);
     if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
@@ -226,10 +236,50 @@ bool SelfInstallAppImage(const Update& update, QWidget* parent)
     f.setPermissions(QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
   }
 
-  // (5) Launch the helper detached and quit. argv order matches $1..$4: NEW, TARGET, PID, DIR.
+  // (5) Launch the helper and quit. The log lives BESIDE the AppImage so it survives the staging
+  //     dir being removed, and we record the launch from here too -- so even if the helper is
+  //     killed before it writes anything, we can still tell it was launched and by which mechanism.
+  const QString log_path =
+      QFileInfo(appimage).absolutePath() + QStringLiteral("/vibedolphin-update.log");
   const QString pid = QString::number(QCoreApplication::applicationPid());
-  if (!QProcess::startDetached(QStringLiteral("/bin/bash"),
-                               {script_path, new_image, appimage, pid, staging_path}))
+  const QStringList helper_args = {script_path, new_image, appimage, pid, staging_path, log_path};
+
+  const auto append_log = [&log_path](const QString& line) {
+    QFile lf(log_path);
+    if (lf.open(QIODevice::Append | QIODevice::Text))
+    {
+      lf.write(line.toUtf8());
+      lf.close();
+    }
+  };
+  append_log(QStringLiteral("[parent] launching helper: %1 -> %2\n").arg(new_image, appimage));
+
+  // Launch the helper in its OWN systemd scope: the launcher (Steam, a desktop file manager) often
+  // runs us in a transient cgroup that systemd tears down when we exit, which would SIGKILL a plain
+  // detached child before it can swap the binary. A user scope created via systemd-run is managed
+  // by the user's systemd instance, not our cgroup, so it survives. Fall back to setsid (at least a
+  // new session) and then a bare detached bash if systemd-run isn't usable.
+  QStringList sd_args = {QStringLiteral("--user"),    QStringLiteral("--scope"),
+                         QStringLiteral("--collect"), QStringLiteral("--quiet"),
+                         QStringLiteral("--"),        QStringLiteral("/bin/bash")};
+  sd_args += helper_args;
+  QString how = QStringLiteral("systemd-run");
+  bool started = QProcess::startDetached(QStringLiteral("systemd-run"), sd_args);
+  if (!started)
+  {
+    how = QStringLiteral("setsid");
+    started = QProcess::startDetached(QStringLiteral("setsid"),
+                                      QStringList{QStringLiteral("/bin/bash")} + helper_args);
+  }
+  if (!started)
+  {
+    how = QStringLiteral("bash");
+    started = QProcess::startDetached(QStringLiteral("/bin/bash"), helper_args);
+  }
+  append_log(QStringLiteral("[parent] launch via %1 started=%2\n")
+                 .arg(how, started ? QStringLiteral("true") : QStringLiteral("false")));
+
+  if (!started)
   {
     QMessageBox::critical(parent, QObject::tr("Update failed"),
                           QObject::tr("Could not start the update helper."));
