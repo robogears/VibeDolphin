@@ -132,10 +132,6 @@ private:
   void IncrementSelectedStateSlot();
   void DecrementSelectedStateSlot();
   void BootWiiSystemMenu();
-  // Arms the banner-brick watchdog (boot-pending flag + poll timer) so a Wii-Menu boot's crash is
-  // attributed + self-healed. Used by BOTH the GUI "Load Wii System Menu" path and the Steam Deck
-  // kiosk auto-boot (which boots the menu via m_pending_boot, not BootWiiSystemMenu).
-  void ArmWiiMenuBrickWatchdog();
   void ScheduleForwarderAutoSync();
   void RunForwarderSync();
   // Shared body for the auto-sync, the Tools-menu action, and the kiosk pre-boot sync.
@@ -144,9 +140,15 @@ private:
   // progress/result/early-return feedback (the auto-sync and kiosk paths stay silent).
   void RunForwarderSyncImpl(bool synchronous, bool user_invoked);
   void ShowForwarderSyncResult(const WiiUtils::ForwarderSyncResult& result);
-  // Invoked when a forwarder channel banner bricks the Wii Menu's grid renderer: stops the
-  // wedged session and tells the user (safe banners are rebuilt on the next launch).
-  void OnWiiMenuBannerBrick();
+
+  // VibeDolphin self-updater. Runs the blocking GitHub query on a worker thread, then marshals the
+  // result back to the UI. |manual| surfaces "you're up to date"/"couldn't check" feedback; the
+  // silent startup auto-check only speaks up when an update is actually available.
+  void CheckForVibeUpdate(bool manual);
+  // Kiosk (--wii-menu) pre-boot path: synchronously checks for an update (we're already on the UI
+  // thread with the event loop live), offers it, and -- only if the user did NOT start a self-
+  // install + relaunch -- boots the Wii Menu from the deferred m_pending_boot.
+  void KioskUpdateThenBoot();
 
   void PerformOnlineUpdate(const std::string& region);
 
@@ -280,9 +282,10 @@ private:
   // Tracked worker for the background channel reconcile; joined in the destructor so a sync
   // never outlives the window (which would race NAND teardown).
   std::thread m_forwarder_sync_thread;
-  // Polls for a Wii Menu banner brick (flagged on the CPU thread by the panic handler) while
-  // the System Menu is the running session; armed in BootWiiSystemMenu, stopped on stop.
-  QTimer* m_wii_menu_brick_timer = nullptr;
+  // Tracked worker for the GitHub update check; joined in the destructor. Guarded so only one
+  // check runs at a time (the menu action can't stack on top of the startup auto-check).
+  std::thread m_vibe_update_thread;
+  bool m_vibe_update_in_progress = false;
 
   SettingsWindow* m_settings_window = nullptr;
   // m_fifo_window doesn't set MainWindow as its parent so that the fifo can be focused without

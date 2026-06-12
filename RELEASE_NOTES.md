@@ -1,3 +1,25 @@
+# What's new in v0.1.12
+
+**Two big things: VibeDolphin can update itself now, and banner handling got a lot simpler.**
+
+## Built-in updater — no more hunting for the latest AppImage
+- **Help → "Check for VibeDolphin Updates…"** queries the GitHub releases and, if there's a newer build, offers to grab it. On the Steam Deck the same check runs **once, right before the Wii Menu boots**, so you're offered the update at the one calm moment before gameplay.
+- **One click to update.** On the AppImage it downloads the new build, **verifies its SHA-256 checksum** before trusting it, swaps itself in place, and relaunches — straight back into the Wii Menu. No terminal, no `chmod`, no re-adding to Steam.
+- **Safe by design.** A failed check is reported as "couldn't check," never silently treated as up-to-date. The download is checksum-verified before it's ever made executable. If anything can't self-install (e.g. a read-only location), it just opens the releases page instead.
+
+> **One-time manual step:** the updater ships *in* this build, so it can only update you to releases that come *after* it. Download this one by hand; from here on, VibeDolphin keeps itself current.
+
+## Banner handling is just a blacklist now
+All the automatic crash-detection, "safe mode," migration markers, and self-heal machinery is **gone** — no more `forwarder_safe_mode`, `forwarder_regen_pending`, `forwarder_realart_migrated`, or `wii_menu_quarantine.txt`, and nothing turns your banners into the Mario Kart donor en masse.
+
+- **Every game shows its own real banner.**
+- **A blocklisted game shows the yellow "image not loaded" tile.** The blocklist = a built-in entry for Mario Party 9 (all regions) + your own `forwarder_blocklist.txt` (one game ID per line).
+- Each launch rebuilds the channel tiles from that blocklist, so it's always consistent — no stale state, no markers, nothing to clean up.
+
+If some other game ever crashes the menu, just add its game ID to `forwarder_blocklist.txt` in `~/.local/share/vibedolphin/` and relaunch — it becomes a yellow tile, everything else keeps its real banner.
+
+---
+
 # What's new in v0.1.11
 
 This release makes the menu-crash handling reliable and ships Mario Party 9 pre-flagged.

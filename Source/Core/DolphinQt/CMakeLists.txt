@@ -418,6 +418,8 @@ add_executable(dolphin-emu
   Translation.h
   Updater.cpp
   Updater.h
+  VibeUpdater.cpp
+  VibeUpdater.h
   WiiUpdate.cpp
   WiiUpdate.h
 )

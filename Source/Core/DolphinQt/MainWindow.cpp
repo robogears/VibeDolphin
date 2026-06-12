@@ -130,6 +130,7 @@
 #include "DolphinQt/TAS/GCTASInputWindow.h"
 #include "DolphinQt/TAS/WiiTASInputWindow.h"
 #include "DolphinQt/ToolBar.h"
+#include "DolphinQt/VibeUpdater.h"
 #include "DolphinQt/WiiUpdate.h"
 
 #include "UICommon/DiscordPresence.h"
@@ -364,14 +365,21 @@ MainWindow::MainWindow(Core::System& system, std::unique_ptr<BootParameters> boo
       QApplication::processEvents();
       RunForwarderSyncImpl(/*synchronous=*/true, /*user_invoked=*/false);
       splash.close();
-      // Arm the brick watchdog: the kiosk boots the menu via m_pending_boot below (not
-      // BootWiiSystemMenu), so without this the crash-attribution + self-heal would never run.
-      ArmWiiMenuBrickWatchdog();
+      // Defer the menu boot to a one-shot run once the event loop is live, so we can check for an
+      // app update (and self-install + relaunch if the user accepts) in a context where
+      // QApplication::quit() actually works — exec() resets the quit flag, so a quit() issued from
+      // here in the ctor would be ignored. m_pending_boot is consumed there, not at the end of the
+      // ctor; the guard below skips the immediate boot for kiosk mode.
+      QTimer::singleShot(0, this, &MainWindow::KioskUpdateThenBoot);
     }
   }
   else
   {
     ScheduleForwarderAutoSync();
+    // Silent startup update check, but only on a clean launch to the game list — not when booting
+    // straight into a game via --exec (a modal update prompt over a running game is jarring).
+    if (m_pending_boot == nullptr)
+      CheckForVibeUpdate(/*manual=*/false);
   }
 
   if (!ResourcePack::Init())
@@ -394,7 +402,9 @@ MainWindow::MainWindow(Core::System& system, std::unique_ptr<BootParameters> boo
 
   Host::GetInstance()->SetMainWindowHandle(reinterpret_cast<void*>(winId()));
 
-  if (m_pending_boot != nullptr)
+  // Kiosk mode defers its Wii Menu boot to KioskUpdateThenBoot (after the pre-boot update check),
+  // so it must not also be booted here.
+  if (m_pending_boot != nullptr && !m_wii_menu_kiosk)
   {
     StartGame(std::move(m_pending_boot));
     m_pending_boot.reset();
@@ -407,6 +417,11 @@ MainWindow::~MainWindow()
   // Core/UICommon shutdown.
   if (m_forwarder_sync_thread.joinable())
     m_forwarder_sync_thread.join();
+
+  // Finish any in-flight update check before teardown so its QueueOnObject callback can't fire
+  // into a half-destroyed window.
+  if (m_vibe_update_thread.joinable())
+    m_vibe_update_thread.join();
 
   // Shut down NetPlay first to avoid race condition segfault
   Settings::Instance().ResetNetPlayClient();
@@ -492,11 +507,6 @@ void MainWindow::InitCoreCallbacks()
     if (state == Core::State::Uninitialized)
     {
       OnStopComplete();
-      // The System Menu session (if any) has ended: disarm the banner-brick watchdog so a
-      // later game's stray memory fault is never misattributed to the channel grid.
-      WiiUtils::SetWiiMenuBootPending(false);
-      if (m_wii_menu_brick_timer)
-        m_wii_menu_brick_timer->stop();
     }
 
     if (state == Core::State::Running && m_fullscreen_requested)
@@ -681,6 +691,8 @@ void MainWindow::ConnectMenuBar()
           &GameList::OnGameListVisibilityChanged);
 
   connect(m_menu_bar, &MenuBar::ShowAboutDialog, this, &MainWindow::ShowAboutDialog);
+  connect(m_menu_bar, &MenuBar::CheckForVibeUpdate, this,
+          [this] { CheckForVibeUpdate(/*manual=*/true); });
 
   connect(m_game_list, &GameList::SelectionChanged, m_menu_bar, &MenuBar::SelectionChanged);
   connect(this, &MainWindow::ReadOnlyModeChanged, m_menu_bar, &MenuBar::ReadOnlyModeChanged);
@@ -822,11 +834,6 @@ void MainWindow::ConnectHost()
   // menu's PPC is already reset-and-paused (so nothing runs into a crash mid-swap).
   WiiUtils::SetForwarderBootHandler([this](const std::string& disc_path) {
     QueueOnObject(this, [this, disc_path] {
-      // Leaving the menu to boot a game: disarm the banner-brick watchdog (the game itself
-      // may legitimately fault, and that must not be treated as a menu brick).
-      WiiUtils::SetWiiMenuBootPending(false);
-      if (m_wii_menu_brick_timer)
-        m_wii_menu_brick_timer->stop();
       const SuppressConfirmOnStop confirm_guard;
       StartGame(disc_path, ScanForSecondDisc::No);
     });
@@ -1702,60 +1709,12 @@ void MainWindow::PerformOnlineUpdate(const std::string& region)
   Settings::Instance().NANDRefresh();
 }
 
-void MainWindow::ArmWiiMenuBrickWatchdog()
-{
-  // While the System Menu is the running session, a null-read panic is attributed to the channel
-  // grid: the panic handler records the culprit + suppresses the dialog spam and flags a brick;
-  // the timer polls that flag and stops cleanly so the next launch self-heals. MUST be armed for
-  // BOTH the GUI "Load Wii System Menu" path and the kiosk auto-boot, or the crash isn't caught.
-  WiiUtils::SetWiiMenuBootPending(true);
-  if (!m_wii_menu_brick_timer)
-  {
-    // Poll for a brick flagged on the CPU thread by the panic handler. Polling (vs a
-    // cross-thread signal) deliberately keeps the crash-detection path simple and avoids
-    // running any callback from inside the guest-fault panic handler; 500ms is imperceptible.
-    constexpr int kBrickPollIntervalMs = 500;
-    m_wii_menu_brick_timer = new QTimer(this);
-    m_wii_menu_brick_timer->setInterval(kBrickPollIntervalMs);
-    connect(m_wii_menu_brick_timer, &QTimer::timeout, this, [this] {
-      if (WiiUtils::ConsumeWiiMenuBrickDetected())
-        OnWiiMenuBannerBrick();
-    });
-  }
-  m_wii_menu_brick_timer->start();
-}
-
 void MainWindow::BootWiiSystemMenu()
 {
-  // Apply any pending heal BEFORE booting. A brick sets a one-shot regen marker; the kiosk path
-  // already consumes it pre-boot, but a desktop "Load Wii System Menu" must too -- otherwise a
-  // crashing banner is never rebuilt between menu boots and it just keeps crashing (an infinite
-  // loop). Synchronous so the rebuild finishes before the menu reads the banners.
+  // Reconcile the channel tiles before booting so they reflect the current library + blocklist
+  // (synchronous, so the rebuild finishes before the menu reads the banners), then boot the menu.
   RunForwarderSyncImpl(/*synchronous=*/true, /*user_invoked=*/false);
-  ArmWiiMenuBrickWatchdog();
   StartGame(std::make_unique<BootParameters>(BootParameters::NANDTitle{Titles::SYSTEM_MENU}));
-}
-
-void MainWindow::OnWiiMenuBannerBrick()
-{
-  if (m_wii_menu_brick_timer)
-    m_wii_menu_brick_timer->stop();
-  // Deliberately do NOT clear the boot-pending flag here: a bad banner keeps faulting until the
-  // CPU halts, and keeping the flag set means those flood panics stay suppressed (no dialog spam)
-  // while RequestStop tears the menu down. The Uninitialized state callback clears it once the
-  // menu has actually stopped.
-  // Stop the wedged menu without the "confirm stop" prompt; the heal markers are already
-  // written, so the next launch (or Tools > Sync Wii Menu Channels) rebuilds safe banners.
-  {
-    const SuppressConfirmOnStop confirm_guard;
-    RequestStop();
-  }
-  ModalMessageBox::warning(
-      this, tr("Wii Menu"),
-      tr("A channel banner crashed the Wii Menu's channel grid.\n\nVibeDolphin has switched to safe "
-         "placeholder tiles so it boots cleanly next time. To give the offending game an \"image "
-         "not loaded\" tile while every other game keeps its real banner, add its game ID to "
-         "forwarder_blocklist.txt in your VibeDolphin user folder (one ID per line)."));
 }
 
 void MainWindow::RunForwarderSync()
@@ -1766,15 +1725,10 @@ void MainWindow::RunForwarderSync()
 
 void MainWindow::ShowForwarderSyncResult(const WiiUtils::ForwarderSyncResult& result)
 {
-  const bool changed = result.installed || result.uninstalled || result.moved;
-  QString msg = changed ? tr("Wii Menu channels updated: %1 added, %2 removed.")
-                              .arg(result.installed)
-                              .arg(result.uninstalled)
-                        : tr("Wii Menu channels are already up to date.");
+  QString msg = tr("Wii Menu channels synced: %1 game(s).").arg(result.installed);
   if (result.failed != 0)
   {
-    msg += tr("\n\n%1 game(s) could not be added yet (no usable banner / donor).")
-               .arg(result.failed);
+    msg += tr("\n\n%1 game(s) could not be added (no usable banner / donor).").arg(result.failed);
   }
   ModalMessageBox::information(this, tr("Sync Wii Menu Channels"), msg);
 }
@@ -1808,18 +1762,11 @@ void MainWindow::RunForwarderSyncImpl(bool synchronous, bool user_invoked)
       return;  // no System Menu -> forwarder tiles can't appear; nothing to sync
     }
   }
-  // Crash self-heal: if a prior session recorded a banner brick, run the one-shot regen. An
-  // attributed brick quarantines just the culprit (caution tile; other tiles keep their art); an
-  // unattributed brick also set the persistent safe-mode marker -> blanket plain-donor rebuild.
-  if (WiiUtils::HasSafeBannerMarker())
-    WiiUtils::SetSafeBannerMode(true);
-  const bool force_reinstall = WiiUtils::ConsumeBannerRegenPending();
-  auto body = [this, force_reinstall, user_invoked] {
+  auto body = [this, user_invoked] {
     const std::vector<std::string> dirs = Config::GetIsoPaths();
     const std::vector<std::string_view> dir_views(dirs.begin(), dirs.end());
     const std::vector<std::string> paths = UICommon::FindAllGamePaths(dir_views, true);
-    const WiiUtils::ForwarderSyncResult result =
-        WiiUtils::SyncForwardersWithLibrary(paths, force_reinstall);
+    const WiiUtils::ForwarderSyncResult result = WiiUtils::SyncForwardersWithLibrary(paths);
     if (user_invoked)
       QueueOnObject(this, [this, result] { ShowForwarderSyncResult(result); });
   };
@@ -1840,6 +1787,83 @@ void MainWindow::ScheduleForwarderAutoSync()
   // Run the reconcile once per launch, silently, after the main window is up.
   static std::once_flag s_once;
   std::call_once(s_once, [this] { RunForwarderSyncImpl(/*synchronous=*/false, /*user_invoked=*/false); });
+}
+
+void MainWindow::CheckForVibeUpdate(bool manual)
+{
+  // Only one check at a time: a manual menu check while the startup check is still running is a
+  // no-op rather than a second network round-trip / stacked dialog.
+  if (m_vibe_update_in_progress)
+    return;
+  m_vibe_update_in_progress = true;
+
+  // Reuse the handle: join any prior (already-finished) worker before reassigning. The destructor
+  // also joins it so a check never outlives the window.
+  if (m_vibe_update_thread.joinable())
+    m_vibe_update_thread.join();
+
+  m_vibe_update_thread = std::thread([this, manual] {
+    const VibeUpdate::Result result = VibeUpdate::CheckForUpdate();  // blocking GitHub query
+    // Marshal back to the UI thread; m_vibe_update_in_progress is only ever touched there.
+    QueueOnObject(this, [this, manual, result] {
+      m_vibe_update_in_progress = false;
+      switch (result.status)
+      {
+      case VibeUpdate::CheckStatus::UpdateAvailable:
+        if (result.update)
+          VibeUpdate::ShowUpdateDialog(*result.update, this);
+        break;
+      case VibeUpdate::CheckStatus::UpToDate:
+        if (manual)
+        {
+          ModalMessageBox::information(
+              this, tr("Check for VibeDolphin Updates"),
+              tr("You're up to date.\n\nVibeDolphin %1 is the latest version.")
+                  .arg(QString::fromStdString(VibeUpdate::CurrentVersion())));
+        }
+        break;
+      case VibeUpdate::CheckStatus::CheckFailed:
+        if (manual)
+        {
+          ModalMessageBox::warning(
+              this, tr("Check for VibeDolphin Updates"),
+              tr("Couldn't check for updates.\n\nCheck your internet connection and try again, or "
+                 "visit the releases page."));
+        }
+        break;
+      }
+    });
+  });
+}
+
+void MainWindow::KioskUpdateThenBoot()
+{
+  // Deferred from the kiosk ctor path so we run with a live event loop. m_pending_boot holds the
+  // Wii Menu boot that the end-of-ctor boot intentionally skipped for kiosk mode.
+  if (m_pending_boot == nullptr)
+    return;
+
+  // A quick splash so the (usually sub-second, bounded ~10s offline) check doesn't look like a hang
+  // on the otherwise-empty fullscreen window.
+  {
+    QSplashScreen splash(QPixmap(1, 1));
+    splash.showMessage(tr("Checking for updates…"), Qt::AlignCenter, Qt::white);
+    splash.show();
+    QApplication::processEvents();
+    const VibeUpdate::Result result = VibeUpdate::CheckForUpdate();
+    splash.close();
+    // The one good moment to offer an update on the Deck: before gameplay. If the user accepts a
+    // self-install, the app is quitting to relaunch — leave the menu unbooted underneath it.
+    if (result.status == VibeUpdate::CheckStatus::UpdateAvailable && result.update)
+    {
+      if (VibeUpdate::ShowUpdateDialog(*result.update, this))
+        return;
+    }
+  }
+
+  // No update, a failed/declined check, or a release-page fallback: boot the Wii Menu as usual.
+  StartGame(std::move(m_pending_boot));
+  m_pending_boot.reset();
 }
 
 void MainWindow::NetPlayInit()

@@ -80,24 +80,6 @@ bool s_forwarder_map_loaded = false;
 // Guards SyncForwardersWithLibrary against re-entrancy / concurrent runs.
 std::atomic<bool> s_forwarder_sync_running{false};
 
-// Crash safety net. s_safe_banner_mode forces plain-donor banners (no per-game art).
-// s_wii_menu_boot_pending is true only while the emulated System Menu is the running
-// session, so a null-read panic in that window is attributed to the channel grid.
-// s_wii_menu_brick_detected is the in-session flag the frontend polls to stop + notify.
-// s_brick_handled_this_boot makes the first brick panic the only one we ACT on: a bad banner
-// often spews a flood of faults (a garbage-pointer loop), and we must quarantine the culprit
-// exactly once and suppress the rest -- not re-attribute (the marker is consumed on the first
-// read, so re-entry would wrongly trip the "unknown culprit -> blanket safe mode" backstop).
-std::atomic<bool> s_safe_banner_mode{false};
-std::atomic<bool> s_wii_menu_boot_pending{false};
-std::atomic<bool> s_wii_menu_brick_detected{false};
-std::atomic<bool> s_brick_handled_this_boot{false};
-
-// Persistent markers under the user dir: SAFE_MODE makes safe-banner mode sticky across
-// launches; REGEN_PENDING is the one-shot "rebuild now" flag set on a brick.
-const char* const SAFE_MODE_MARKER = "forwarder_safe_mode";
-const char* const REGEN_PENDING_MARKER = "forwarder_regen_pending";
-
 // Parse a hex title id from a (possibly hand-edited / truncated) JSON string. Non-throwing
 // (Core is built with -fno-exceptions, so std::stoull on bad input would terminate); returns
 // nullopt to skip the row. LookupForwarderDiscPath runs on the emulation/CPU thread, so a
@@ -604,75 +586,6 @@ void RequestForwarderBoot(const std::string& disc_path)
     ERROR_LOG_FMT(IOS_ES, "RequestForwarderBoot: no handler registered (disc: {})", disc_path);
 }
 
-void SetSafeBannerMode(bool enabled)
-{
-  s_safe_banner_mode.store(enabled);
-}
-bool IsSafeBannerMode()
-{
-  return s_safe_banner_mode.load();
-}
-void SetWiiMenuBootPending(bool pending)
-{
-  // Reset the once-per-boot brick guard when arming a fresh menu boot.
-  if (pending)
-    s_brick_handled_this_boot.store(false);
-  s_wii_menu_boot_pending.store(pending);
-}
-
-bool NotePanicMessageMaybeBrick(const char* text)
-{
-  if (!s_wii_menu_boot_pending.load() || text == nullptr)
-    return false;
-  const std::string_view msg(text);
-  // Memory-access panics carry "PC = 0x..."; match that (plus the English wording) so we catch the
-  // brick regardless of UI translation. Gated on the menu-boot window above, so a normal game's
-  // stray fault is never misattributed.
-  if (msg.find("PC = 0x") == std::string_view::npos &&
-      msg.find("Invalid read") == std::string_view::npos &&
-      msg.find("Invalid write") == std::string_view::npos)
-  {
-    return false;
-  }
-  // A bad banner can fault repeatedly (a garbage-pointer loop spewing many panics). Act on the
-  // FIRST one only; suppress the rest (return true without re-processing) so the flood neither
-  // spams dialogs nor re-runs the heal. Reset per boot in SetWiiMenuBootPending.
-  if (s_brick_handled_this_boot.exchange(true))
-    return true;
-  // We can't reliably tell WHICH banner crashed -- the System Menu reads every banner before it
-  // renders them, so "the last one read" is not the culprit (guessing wrongly quarantined an
-  // innocent game). So don't guess: switch to blanket safe-banner mode (the next launch rebuilds
-  // every tile as a safe placeholder, so the menu boots cleanly) and request that one-shot
-  // rebuild. The user pins the offending game by adding its id to forwarder_blocklist.txt -- it
-  // then gets a caution tile while every other game keeps its real banner.
-  const std::string dir = File::GetUserPath(D_USER_IDX);
-  File::CreateEmptyFile(dir + SAFE_MODE_MARKER);
-  File::CreateEmptyFile(dir + REGEN_PENDING_MARKER);
-  s_safe_banner_mode.store(true);
-  s_wii_menu_brick_detected.store(true);
-  WARN_LOG_FMT(IOS_ES, "Wii Menu banner brick detected; engaging safe-banner mode for relaunch");
-  return true;
-}
-
-bool ConsumeWiiMenuBrickDetected()
-{
-  return s_wii_menu_brick_detected.exchange(false);
-}
-
-bool HasSafeBannerMarker()
-{
-  return File::Exists(File::GetUserPath(D_USER_IDX) + SAFE_MODE_MARKER);
-}
-
-bool ConsumeBannerRegenPending()
-{
-  const std::string path = File::GetUserPath(D_USER_IDX) + REGEN_PENDING_MARKER;
-  if (!File::Exists(path))
-    return false;
-  File::Delete(path);
-  return true;
-}
-
 u64 ComputeForwarderTitleId(const std::string& game_id, u16 revision)
 {
   // Deterministic, file-location-independent id from the disc's stable identity.
@@ -732,25 +645,23 @@ std::optional<ForwarderInfo> InstallForwarder(const std::string& disc_path)
     return std::nullopt;
   }
 
-  // Build the channel banner:
-  //  * a normal game gets its OWN real banner verbatim -> truest per-game art. If that banner
-  //    crashes the System Menu, the self-heal attributes the crash to this game, quarantines it,
-  //    and it becomes a caution tile on the next launch ("crash once to auto-find the bad game").
-  //  * a flagged game (manual blocklist or runtime auto-quarantine) gets the yellow "image not
-  //    loaded" caution tile, built on the proven-safe donor scene so it can't brick.
-  //  * with no readable game banner, or while in blanket safe-banner mode (the loop backstop),
-  //    falls back to the plain donor tile. With no donor at all the game is skipped (no tile).
+  // Build the channel banner. The blocklist is the only knob:
+  //  * a flagged game (the built-in MP9 seed, or forwarder_blocklist.txt) gets the yellow "image
+  //    not loaded" caution tile, built on the proven-safe donor scene so it can't crash the menu;
+  //  * every other game gets its OWN real banner verbatim (truest per-game art);
+  //  * fall back to the plain donor tile if there's no readable game banner; skip the game (no
+  //    tile) only if there's no donor either.
   static const bool s_banner_tools_ok = Banner::RunSelfTests();
   const std::vector<u8>* const donor = GetDonorBanner();
   const std::optional<std::vector<u8>> game_bnr = ReadFullBanner(*volume, partition);
   const bool blocklisted = IsBannerBlocklisted(game_id);
   std::optional<std::vector<u8>> banner;
-  if (game_bnr && !blocklisted && !IsSafeBannerMode())
-    banner = *game_bnr;  // the game's own real banner (verbatim); auto-quarantine is the safety net
-  if (!banner && blocklisted && donor && s_banner_tools_ok && game_bnr)
+  if (blocklisted && donor && s_banner_tools_ok && game_bnr)
     banner = Banner::BuildCautionBanner(*donor, *game_bnr);  // yellow "image not loaded" tile
+  else if (game_bnr && !blocklisted)
+    banner = *game_bnr;  // the game's own real banner (verbatim)
   if (!banner && donor)
-    banner = BuildSafeBanner(*volume, partition);  // plain donor scene + game titles (safe fallback)
+    banner = BuildSafeBanner(*volume, partition);  // plain donor scene + game titles (fallback)
   if (!banner)
   {
     WARN_LOG_FMT(IOS_ES,
@@ -835,8 +746,7 @@ bool UninstallForwarder(u64 title_id)
   return true;
 }
 
-ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& current_disc_paths,
-                                              bool force_reinstall, bool full_rebuild)
+ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& current_disc_paths)
 {
   ForwarderSyncResult result;
   if (s_forwarder_sync_running.exchange(true))
@@ -846,100 +756,36 @@ ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& cu
   }
   const Common::ScopeGuard running_guard{[] { s_forwarder_sync_running.store(false); }};
 
-  // Re-read the blocklist from disk so a just-quarantined game (or a user-deleted list) is
-  // honored this run, even on an in-session Tools > Sync without a relaunch.
+  // Re-read the blocklist from disk so blocklist edits (forwarder_blocklist.txt) are honored this
+  // run, even on an in-session Tools > Sync without a relaunch.
   InvalidateBannerBlocklist();
 
-  // One-time migration to the real-banner model: the first sync after upgrading rebuilds every
-  // tile so games installed by older versions as plain-donor switch to their own real banner (and
-  // any banner that crashes the menu then goes through the auto-quarantine flow). Runs once.
-  const std::string migrated_marker = File::GetUserPath(D_USER_IDX) + "forwarder_realart_migrated";
-  if (!File::Exists(migrated_marker))
-  {
-    full_rebuild = true;
-    File::CreateEmptyFile(migrated_marker);
-  }
-
-  // A full rebuild -- the one-time migration or an explicit --generate-forwarders -- reinstalls
-  // every tile with its real banner, so it also clears any sticky blanket safe-banner state. This
-  // is the user's clean "retry real art" path after the crash-loop backstop has engaged (a
-  // genuinely unresolvable crash simply re-engages it). The auto-heal (force_reinstall WITHOUT
-  // full_rebuild) deliberately does NOT clear it, so the backstop stays put and can't oscillate.
-  if (full_rebuild)
-  {
-    File::Delete(File::GetUserPath(D_USER_IDX) + SAFE_MODE_MARKER);
-    s_safe_banner_mode.store(false);
-  }
-
-  // Phase 0: make sure a donor banner exists (capture one from a known-safe game if not), so
-  // the crash-proof banner pipeline has a host scene. Without it, games are skipped, not bricked.
+  // Make sure a donor banner exists (the host scene the caution tiles are built on); capture one
+  // from a known-safe game in the library if there isn't one yet.
   EnsureDonorBanner(current_disc_paths);
 
-  // Phase 1: the existing map is the authoritative "installed" set.
+  // Rebuild the forwarder set from scratch every sync: uninstall every existing forwarder, then
+  // install one per current Wii disc -- its OWN real banner, or the yellow "image not loaded"
+  // caution tile if the game is blocklisted (the built-in MP9 seed, or forwarder_blocklist.txt).
+  // The blocklist is the only persistent state: no safe-mode, no migration markers, no crash-heal.
+  // Re-running is deterministic (same tiles), so it's effectively idempotent.
   const std::vector<ForwarderMapEntry> old_entries = LoadForwarderMapFull();
-  std::map<std::string, ForwarderMapEntry> old_by_path;
-  std::map<u64, ForwarderMapEntry> old_by_tid;
-  for (const ForwarderMapEntry& e : old_entries)
   {
-    old_by_path.emplace(e.disc_path, e);
-    old_by_tid.emplace(e.title_id, e);
-  }
-
-  // Force regen. Two modes:
-  //  * Blanket (full_rebuild -- the one-time migration or an explicit --generate-forwarders, OR
-  //    safe-banner mode): drop EVERY forwarder and rebuild them all. Banner type then follows the
-  //    mode: real verbatim banners normally, or plain safe donors while in safe-banner mode.
-  //  * Selective (the post-brick heal): drop ONLY the quarantined games so they're rebuilt as
-  //    caution tiles, while every other game keeps its existing real banner untouched (its path
-  //    stays in old_by_path -> kept as-is below). This is the common heal path.
-  if (force_reinstall || full_rebuild)
-  {
-    const bool blanket = full_rebuild || IsSafeBannerMode();
     IOS::HLE::Kernel ios;
     for (const u64 tid : ios.GetESCore().GetInstalledTitles())
     {
-      if (!IsForwarderTitle(tid))
-        continue;
-      const auto e = old_by_tid.find(tid);
-      const bool quarantined = e != old_by_tid.end() && IsBannerBlocklisted(e->second.game_id);
-      if (blanket || quarantined)
+      if (IsForwarderTitle(tid))
         UninstallForwarder(tid);
-    }
-    if (blanket)
-    {
-      old_by_path.clear();
-      old_by_tid.clear();
-    }
-    else
-    {
-      // Drop only the quarantined entries from the "keep" maps so they take the reinstall path.
-      for (auto it = old_by_path.begin(); it != old_by_path.end();)
-        it = IsBannerBlocklisted(it->second.game_id) ? old_by_path.erase(it) : std::next(it);
-      for (auto it = old_by_tid.begin(); it != old_by_tid.end();)
-        it = IsBannerBlocklisted(it->second.game_id) ? old_by_tid.erase(it) : std::next(it);
     }
   }
 
-  // Phases 2-3: classify each current library path into the desired set.
   std::vector<ForwarderMapEntry> desired;
   std::unordered_set<u64> desired_tids;
   for (const std::string& path : current_disc_paths)
   {
-    // Already installed at this exact path -> keep as-is (no disc open, no import).
-    const auto present = old_by_path.find(path);
-    if (present != old_by_path.end())
-    {
-      if (desired_tids.insert(present->second.title_id).second)
-      {
-        desired.push_back(present->second);
-        ++result.already_present;
-      }
-      continue;
-    }
-    // New path: identify the disc to compute its deterministic forwarder id.
     const std::unique_ptr<DiscIO::Volume> volume = DiscIO::CreateVolume(path);
     if (!volume || volume->GetVolumeType() != DiscIO::Platform::WiiDisc)
-      continue;  // not a Wii disc -> ignore (do NOT treat as a removal)
+      continue;  // not a Wii disc -> ignore
     const DiscIO::Partition partition = volume->GetGamePartition();
     const std::string game_id = volume->GetGameID(partition);
     if (game_id.empty())
@@ -948,27 +794,6 @@ ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& cu
     const u64 tid = ComputeForwarderTitleId(game_id, revision);
     if (desired_tids.count(tid))
       continue;  // duplicate dump of a game already handled this run
-
-    const auto moved = old_by_tid.find(tid);
-    if (moved != old_by_tid.end())
-    {
-      // Moved/renamed file, same game identity -> already installed, just repoint.
-      ForwarderMapEntry e = moved->second;
-      e.disc_path = path;
-      desired.push_back(e);
-      desired_tids.insert(tid);
-      ++result.moved;
-      continue;
-    }
-    // Not in the map. If the title already exists in NAND (e.g. the map was lost and is
-    // being rebuilt), just re-record it; otherwise build + import it (the expensive path).
-    if (File::Exists(Common::GetTMDFileName(tid)))
-    {
-      desired.push_back({tid, game_id, revision, path});
-      desired_tids.insert(tid);
-      ++result.already_present;
-      continue;
-    }
     const std::optional<ForwarderInfo> info = InstallForwarder(path);
     if (!info)
     {
@@ -980,24 +805,7 @@ ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& cu
     ++result.installed;
   }
 
-  // Phase 4: remove NAND forwarder titles no longer wanted (removed games + orphans).
-  // desired_tids is fully computed first, so a moved game (its id stays desired) is never deleted.
-  std::vector<u64> installed_titles;
-  {
-    IOS::HLE::Kernel ios;
-    installed_titles = ios.GetESCore().GetInstalledTitles();
-  }
-  for (const u64 tid : installed_titles)
-  {
-    if (!IsForwarderTitle(tid) || desired_tids.count(tid))
-      continue;
-    if (UninstallForwarder(tid))
-      ++result.uninstalled;
-    else
-      ++result.orphaned;
-  }
-
-  // Phase 5: persist only if the (title_id, disc_path) set actually changed.
+  // Persist the map only if the (title_id, disc_path) set actually changed.
   const auto key = [](const ForwarderMapEntry& e) {
     return fmt::format("{:016x}|{}", e.title_id, e.disc_path);
   };
@@ -1012,14 +820,12 @@ ForwarderSyncResult SyncForwardersWithLibrary(const std::vector<std::string>& cu
     result.map_modified = true;
   }
 
-  // Pack the forwarder tiles into the Wii Menu's channel grid so they stack evenly (no gaps
-  // when a game is removed, deterministic order instead of scattered). Runs every sync; the
-  // menu safely falls back to its own layout if the file is ever malformed.
+  // Pack the forwarder tiles into the Wii Menu's channel grid so they stack evenly (deterministic
+  // order, no gaps). Runs every sync; the menu safely falls back to its own layout if the file is
+  // ever malformed.
   RepackWiiMenuChannelLayout(desired);
 
-  INFO_LOG_FMT(IOS_ES,
-               "Forwarder sync: installed={} moved={} present={} uninstalled={} failed={} (map {})",
-               result.installed, result.moved, result.already_present, result.uninstalled,
+  INFO_LOG_FMT(IOS_ES, "Forwarder sync: installed={} failed={} (map {})", result.installed,
                result.failed, result.map_modified ? "updated" : "unchanged");
   return result;
 }

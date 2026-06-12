@@ -697,6 +697,12 @@ void MenuBar::AddHelpMenu()
     help_menu->addAction(tr("&Check for Updates..."), this, &MenuBar::InstallUpdateManually);
   }
 
+  // VibeDolphin's own self-updater (GitHub Releases). Always offered -- it works on the AppImage
+  // builds the upstream Dolphin updater does not cover, and falls back to opening the release page.
+  help_menu->addSeparator();
+  help_menu->addAction(tr("Check for &VibeDolphin Updates..."), this,
+                       &MenuBar::CheckForVibeUpdate);
+
 #ifndef __APPLE__
   help_menu->addSeparator();
 #endif

@@ -56,14 +56,6 @@
 static bool QtMsgAlertHandler(const char* caption, const char* text, bool yes_no,
                               Common::MsgType style)
 {
-  // VibeDolphin crash self-heal: if a forwarder channel banner just bricked the Wii Menu's
-  // grid renderer, swallow the (repeating) null-read panic so it doesn't flood the screen.
-  // The marker written here makes the next launch rebuild every channel with a safe banner;
-  // MainWindow also stops emulation and notifies the user. Gated on an active Wii Menu boot
-  // inside WiiUtils, so a normal game's stray fault still shows its dialog as usual.
-  if (style == Common::MsgType::Warning && WiiUtils::NotePanicMessageMaybeBrick(text))
-    return false;
-
   const bool called_from_cpu_thread = Core::IsCPUThread();
   const bool called_from_gpu_thread = Core::IsGPUThread();
 
@@ -208,15 +200,13 @@ int main(int argc, char* argv[])
                    &app, [] { Core::HostDispatchJobs(Core::System::GetInstance()); });
 
   // Rebuild Wii Menu forwarder channels for every Wii game in the configured library, then
-  // exit without launching the GUI. Reuses the production reconcile (force_reinstall) so there
-  // is a single install+serialize path.
+  // exit without launching the GUI. Reuses the production reconcile (which rebuilds every tile).
   if (options.is_set("generate_forwarders"))
   {
     const std::vector<std::string> dirs = Config::GetIsoPaths();
     const std::vector<std::string_view> dir_views(dirs.begin(), dirs.end());
     const std::vector<std::string> paths = UICommon::FindAllGamePaths(dir_views, true);
-    const WiiUtils::ForwarderSyncResult result =
-        WiiUtils::SyncForwardersWithLibrary(paths, /*force_reinstall=*/true, /*full_rebuild=*/true);
+    const WiiUtils::ForwarderSyncResult result = WiiUtils::SyncForwardersWithLibrary(paths);
     return result.installed > 0 ? 0 : 1;
   }
 

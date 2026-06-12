@@ -96,6 +96,7 @@ signals:
   void BootGameCubeIPL(DiscIO::Region region);
   void ShowFIFOPlayer();
   void ShowAboutDialog();
+  void CheckForVibeUpdate();
   void ShowCheatsManager();
   void ShowResourcePackManager();
   void ShowSkylanderPortal();
